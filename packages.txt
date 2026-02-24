@@ -1,4 +1,2 @@
 libgdal-dev
 libspatialindex-dev
-libgeos-dev
-libproj-dev

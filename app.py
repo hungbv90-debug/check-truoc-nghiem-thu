@@ -54,8 +54,8 @@ def monitor_resource_usage():
         t = threading.Thread(target=_check, name="ResourceMonitor", daemon=True)
         t.start()
 
-# Kích hoạt giám sát
-monitor_resource_usage()
+# Kích hoạt giám sát (CHỈ DÙNG CHO MÔI TRƯỜNG LOCAL - VÔ HIỆU HÓA KHI LÊN CLOUD)
+# monitor_resource_usage()
 
 # =============================================================================
 # PAGE CONFIG & STYLING
