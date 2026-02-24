@@ -1,7 +1,7 @@
 # ⚡ QC Analytics — Hệ thống Đối soát Nghiệm thu Cáp quang
 
 > **Phiên bản:** 2.5 | **Cập nhật:** 24/02/2026  
-> **Đơn vị:** Ban Đảm bảo Chất lượng — FPT Telecom  
+> **Đơn vị:** 
 > **Framework:** QA Vertical Edition (KWSR Mapping)
 
 ---
@@ -83,5 +83,4 @@ Dự án tuân thủ nghiêm ngặt quy trình **FPT Telecom QA Specialist**:
 *   **Lỗi "Ngoài vùng VN"**: Kiểm tra lại tọa độ (Lat/Lon) trong file Excel có bị nhầm lẫn vị trí không.
 *   **Giao diện bị chậm**: Streamlit tự động quản lý tài nguyên, nếu không sử dụng trong 10s hệ thống sẽ tự động tạm dừng để tiết kiệm CPU.
 
----
-*© 2026 Ban Đảm bảo Chất lượng — FPT Telecom*
+
