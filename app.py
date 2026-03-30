@@ -18,8 +18,7 @@ import streamlit.components.v1 as components
 importlib.reload(data_processor)
 from data_processor import QALogic
 from streamlit.runtime import Runtime
-
-import sys
+import tempfile
 
 def monitor_resource_usage():
     """Tự động tắt app sau 10s nếu không có tab trình duyệt nào đang kết nối (tiết kiệm tài nguyên)."""
@@ -54,8 +53,8 @@ def monitor_resource_usage():
         t = threading.Thread(target=_check, name="ResourceMonitor", daemon=True)
         t.start()
 
-# Kích hoạt giám sát (CHỈ DÙNG CHO MÔI TRƯỜNG LOCAL - VÔ HIỆU HÓA KHI LÊN CLOUD)
-# monitor_resource_usage()
+# Kích hoạt giám sát
+monitor_resource_usage()
 
 # =============================================================================
 # PAGE CONFIG & STYLING
@@ -256,61 +255,115 @@ def process_files(files_design, files_bbnt):
     map_b = {}
     logs = []
     
-    # Capture Project Name: Prioritize BBNT, then Design
+    # Capture Project Name: Prioritize BBNT (especially Vật tư), then Design
     p_name = ""
-    if files_bbnt:
+    all_files = (files_bbnt or []) + (files_design or [])
+    
+    # Priority 1: Find "BB Vật tư" (Material Handover Record)
+    vattu_file = None
+    for f in all_files:
+        fn = f.name.lower()
+        if any(kw in fn for kw in ['vat_tu', 'vattu', 'vt']) and 'bbnt' in fn:
+            vattu_file = f
+            break
+            
+    if vattu_file:
         try:
-            full_name = files_bbnt[0].name
-            base_name = full_name.rsplit('.', 1)[0]
-            # User Request: "Chỉ lấy mỗi mã kế hoạch, bỏ phần _BBNT_DT"
-            # Assumption: Plan Code is before the first underscore
-            p_name = base_name.split('_')[0]
-        except: pass
-    elif files_design:
-        try:
-            full_name = files_design[0].name
-            base_name = full_name.rsplit('.', 1)[0]
-            p_name = base_name.split('_')[0]
+            # Extract characters before first underscore, as requested
+            base_name = vattu_file.name.rsplit('.', 1)[0]
+            parts = base_name.split('_')
+            p_name = parts[0]
+            
+            # If the first part is just a number (e.g., "06_HNI..."), take the second part as the plan code
+            if p_name.isdigit() and len(parts) > 1:
+                p_name = parts[1]
         except: pass
         
+    # Priority 2: Fallback to any other BBNT file if still no prefix or it's "Template"
+    if not p_name or p_name.lower() == 'template':
+        for f in all_files:
+            if 'bbnt' in f.name.lower():
+                try:
+                    base_name = f.name.rsplit('.', 1)[0]
+                    parts = base_name.split('_')
+                    temp_name = parts[0]
+                    if temp_name.isdigit() and len(parts) > 1: temp_name = parts[1]
+                    
+                    if temp_name and temp_name.lower() != 'template':
+                        p_name = temp_name
+                        break
+                except: pass
+                
+    # Priority 3: Last fallback to any Design file
+    if not p_name or p_name.lower() == 'template':
+        for f in all_files:
+            try:
+                base_name = f.name.rsplit('.', 1)[0]
+                parts = base_name.split('_')
+                temp_name = parts[0]
+                if temp_name.isdigit() and len(parts) > 1: temp_name = parts[1]
+                
+                if temp_name and temp_name.lower() != 'template':
+                    p_name = temp_name
+                    break
+            except: pass
+            
+    # Priority 4: Final generic fallback if everything else is still "Template" or empty
+    if not p_name or p_name.lower() == 'template':
+        p_name = "BaoCao"
+
     if p_name:
         st.session_state['project_name'] = p_name
     
-    # Helper to process list of files
-    def _proc(flist, is_bbnt=False):
-        m = {}
-        l = []
-        if not flist: return m, l
+    # Helper to process list of files and distribute to correct maps
+    def _proc_and_distribute(flist):
+        logs = []
+        if not flist: return logs
         for f in flist:
             try:
                 f.seek(0)
-                df = qa.read_excel(f)
-                if df.empty:
-                    l.append(f"⚠️ {f.name}: TRỐNG/LỖI")
+                sheets_dict = qa.read_excel(f)
+                
+                if not sheets_dict:
+                    logs.append(f"⚠️ {f.name}: TRỐNG/LỖI")
                     continue
-                ftype = qa.identify_file_type(df, filename=f.name)
-                df.attrs['name'] = f.name
                 
-                msg = f"✅ {f.name} → {ftype}"
-                
-                if ftype in m:
-                    # Gộp và loại bỏ các dòng bị trùng lặp hoàn toàn
-                    m[ftype] = pd.concat([m[ftype], df], ignore_index=True).drop_duplicates()
-                    msg += " (Gộp & Lọc trùng dòng)"
-                else:
-                    m[ftype] = df
-                l.append(msg)
+                for sname, df in sheets_dict.items():
+                    if df.empty: continue
+                    ftype = qa.identify_file_type(df, filename=f.name, sheet_name=sname)
+                    df.attrs['name'] = f"{f.name} ({sname})"
+                    
+                    msg = f"✅ {f.name} [{sname}] → {ftype}"
+                    
+                    # Phân phối vào đúng bucket dựa trên type
+                    target_map = map_b # Mặc định là BBNT
+                    if ftype in ['thiet_ke', 'Form_import', 'Form_import_cap']:
+                        target_map = map_d
+                    
+                    if ftype in target_map:
+                        target_map[ftype] = pd.concat([target_map[ftype], df], ignore_index=True).drop_duplicates()
+                        msg += " (Gộp & Lọc trùng)"
+                    else:
+                        target_map[ftype] = df
+                    logs.append(msg)
+                    
             except Exception as e:
-                l.append(f"❌ {f.name}: {str(e)}")
-        return m, l
+                logs.append(f"❌ {f.name}: {str(e)}")
+        return logs
 
-    if files_design:
-        map_d, logs_d = _proc(files_design)
-        logs.extend(logs_d)
+    all_uploaded = (files_design or []) + (files_bbnt or [])
+    logs = _proc_and_distribute(all_uploaded)
+
+    # --- TỰ ĐỘNG ĐỒNG BỘ PREFIX (BƯỚC ĐẦU TIÊN) ---
+    # User Request: "Bổ sung thêm file BBNT hàn nối vào để phân tích để tránh trường hợp BBNT đối tượng không có"
+    df_bbnt_dt = map_b.get('doi_tuong', pd.DataFrame())
+    df_bbnt_han = map_b.get('han_noi', pd.DataFrame())
     
-    if files_bbnt:
-        map_b, logs_b = _proc(files_bbnt) 
-        logs.extend(logs_b)
+    if (not df_bbnt_dt.empty or not df_bbnt_han.empty) and map_d:
+        for k in map_d:
+            # Sync all Design-related files using both BBNT sources
+            map_d[k] = qa.sync_design_prefixes(map_d[k], df_bbnt_dt, df_bbnt_han)
+        logs.append("⚙️ Tự động đồng bộ Prefix từ BBNT (Đối tượng & Hàn nối) sang file Thiết kế/Import.")
 
     # Update Session State
     st.session_state['data_bucket']['map_d'] = map_d
@@ -321,38 +374,90 @@ def process_files(files_design, files_bbnt):
     st.session_state['recalculate_results'] = True
 
 def highlight_rows(row):
+    """
+    User Request: Không tô xanh/đỏ cả dòng, chỉ tô ô có giá trị. Cảnh báo màu vàng.
+    Logic: 
+    - ❌ -> Đỏ.
+    - ⚠️ -> Vàng.
+    - ✅ hoặc (Row OK and has value) -> Xanh.
+    """
+    styles = []
     status = str(row.get('Trạng thái Lỗi', ''))
     row_str = " ".join(row.astype(str))
     
-    # 1. Ưu tiên ❌ (Lỗi nghiêm trọng) -> Đỏ
-    if '❌' in row_str:
-        return ['background-color: #fee2e2; color: #991b1b'] * len(row)
+    # Identify if the row is generally error-prone or success-prone
+    is_err_row = '❌' in row_str or any(x in status for x in ['Lệch', 'Thiếu', 'Thừa', 'Cảnh báo', 'Quá tải', 'Lỗi'])
+    is_ok_row = '✅' in row_str or 'Khớp' in status
     
-    # 2. Check các từ khóa lỗi trong Trạng thái Lỗi
-    if any(x in status for x in ['Thiếu', 'Thừa', 'Cảnh báo', 'Quá tải', 'Lỗi']):
-        return ['background-color: #fee2e2; color: #991b1b'] * len(row)
+    red_style = 'background-color: #fee2e2; color: #991b1b'    # Light Red
+    yellow_style = 'background-color: #fef9c3; color: #854d0e' # Light Yellow (Warning)
+    green_style = 'background-color: #dcfce7; color: #166534'  # Light Green
+    
+    colorable_cols = [
+        "Vị trí",
+        "Check Công suất/Mở port", 
+        "Dung lượng (Thiết kế/Import)", 
+        "Mã hộp (Thiết kế/Import)",
+        "Dung lượng (TT/TK)", 
+        "Loại (TT/TK)", 
+        "Chiều dài (TT/TK)", 
+        "Trạng thái Lỗi"
+    ]
+    
+    for col in row.index:
+        col_name = str(col)
+        val = str(row[col])
+        style = ''
         
-    # 3. Check 'Lệch' - Bỏ qua nếu là 'Lệch nhẹ' trong Kiểm tra Vị trí
-    if 'Lệch' in status:
-        loc_val = str(row.get('Kiểm tra Vị trí', ''))
-        if "Lệch nhẹ" in loc_val and "❌" not in row_str:
-            return [''] * len(row)
-        return ['background-color: #fee2e2; color: #991b1b'] * len(row)
+        if col_name in colorable_cols:
+            if '❌' in val:
+                style = red_style
+            elif '⚠️' in val:
+                style = yellow_style
+            elif '✅' in val:
+                style = green_style
+            elif col_name == 'Trạng thái Lỗi':
+                if is_err_row: 
+                    if '⚠️' in val or 'Cảnh báo' in val: style = yellow_style
+                    else: style = red_style
+                elif is_ok_row: style = green_style
+            elif val.strip() != '' and val.strip() != 'nan' and val.strip() != '-':
+                style = green_style
+                
+        styles.append(style)
             
-    # 4. Thành công -> Xanh
-    if 'Khớp' in status or '✅' in row_str:
-        return ['background-color: #dcfce7; color: #166534'] * len(row)
-        
-    return [''] * len(row)
+    return styles
 
-def to_excel(df: pd.DataFrame) -> BytesIO:
+def to_excel(df: pd.DataFrame, pre_rows: list = None) -> BytesIO:
     output = BytesIO()
     df_out = df.copy()
     for c in df_out.columns:
         if "SL" in c and df_out[c].dtype in ['float64', 'float32']:
             df_out[c] = df_out[c].round(1)
+    
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_out.to_excel(writer, index=False, sheet_name='Sheet1')
+        start_row = 0
+        if pre_rows:
+            # Set up the sheet with pre-rows
+            if 'Ket_qua' not in writer.book.sheetnames:
+                writer.book.create_sheet('Ket_qua', 0)
+            ws = writer.book['Ket_qua']
+            for i, txt in enumerate(pre_rows):
+                ws.cell(row=i+1, column=1, value=txt)
+                start_row += 1
+            writer.sheets['Ket_qua'] = ws
+            
+        df_out.to_excel(writer, index=False, sheet_name='Ket_qua', startrow=start_row)
+        
+        # Thêm các file thiết kế/import gốc nếu có
+        bucket = st.session_state.get('data_bucket', {})
+        map_d = bucket.get('map_d', {})
+        
+        if 'Form_import' in map_d and not map_d['Form_import'].empty:
+            map_d['Form_import'].to_excel(writer, index=False, sheet_name='FormImport_Goc')
+        if 'thiet_ke' in map_d and not map_d['thiet_ke'].empty:
+            map_d['thiet_ke'].to_excel(writer, index=False, sheet_name='ThietKe_Goc')
+            
     output.seek(0)
     return output
 
@@ -367,8 +472,8 @@ def main():
         # Custom Logo Area
         st.markdown("""
         <div class="brand-logo">
-            <h2 style="margin:0; color:#3b82f6;">⚡ QC ANALYTICS</h2>
-            <p style="font-size:0.8rem; color:#64748b;">Hệ thống Đối soát Tự động</p>
+            <h2 style="margin:0; color:#3b82f6;">⚡ PHÂN TÍCH ĐỐI SOÁT NGHIỆM THU</h2>
+            <p style="font-size:0.8rem; color:#64748b;">Copyright © by HungBV14</p>
         </div>
         """, unsafe_allow_html=True)
         
@@ -381,6 +486,19 @@ def main():
             
         def on_nav_change():
             st.session_state['nav_state'] = st.session_state['radio_nav']
+            # Reset sync flags and clear old bridge data when navigation occurs
+            st.session_state['_notes_auto_synced'] = False
+            st.session_state['_sai_lech_auto_synced'] = False
+            st.session_state['_tc_sai_lech_synced'] = False
+            
+            # Quan trọng: Xóa dữ liệu cũ trong bridge & cả Widget state để ép JS đồng bộ lại dữ liệu mới nhất
+            st.session_state['_user_notes_data'] = ''
+            st.session_state['_sync_bridge_data'] = ''
+            st.session_state['notes_bridge_input'] = ''
+            st.session_state['sync_bridge_input'] = ''
+            
+            # Force result refresh to use updated notes
+            st.session_state['recalculate_results'] = True
             
         nav_opts = ["Nhật ký & File", "Kết quả phân tích", "Số liệu sai lệch"]
         try:
@@ -391,7 +509,6 @@ def main():
         st.radio(
             "Menu",
             nav_opts,
-            index=cur_idx,
             key="radio_nav",
             on_change=on_nav_change,
             label_visibility="collapsed"
@@ -407,13 +524,26 @@ def main():
         st.markdown('<style>div.sync-bridge-wrapper { position: absolute; opacity: 0; height: 0; overflow: hidden; pointer-events: none; } div:has(> div > input[aria-label="DataSync_Bridge"]) { position: absolute; opacity: 0; height: 0; overflow: hidden; pointer-events: none; }</style>', unsafe_allow_html=True)
         sync_bridge_val = st.text_input("DataSync_Bridge", key="sync_bridge_input", label_visibility="collapsed")
         
-        # Store bridge value in session_state for use on all pages
+        # Bridge cho Ghi chú nhập liệu từ các tab
+        st.markdown('<style>div:has(> div > input[aria-label="GhiChu_Bridge"]) { position: absolute; opacity: 0; height: 0; overflow: hidden; pointer-events: none; }</style>', unsafe_allow_html=True)
+        notes_bridge_val = st.text_input("GhiChu_Bridge", key="notes_bridge_input", label_visibility="collapsed")
+        
+        # Bridge cho Hàn nối Highlights
+        st.markdown('<style>div:has(> div > input[aria-label="HN_Bridge"]) { position: absolute; opacity: 0; height: 0; overflow: hidden; pointer-events: none; }</style>', unsafe_allow_html=True)
+        hn_hl_bridge_val = st.text_input("HN_Bridge", key="hn_bridge_input", label_visibility="collapsed")
+        
+        # Store bridge values in session_state for use on all pages
         if sync_bridge_val and len(sync_bridge_val) > 2:
             st.session_state['_sync_bridge_data'] = sync_bridge_val
+        if notes_bridge_val and len(notes_bridge_val) > 2:
+            st.session_state['_user_notes_data'] = notes_bridge_val
+        if hn_hl_bridge_val and len(hn_hl_bridge_val) > 2:
+            st.session_state['_hn_hl_data'] = hn_hl_bridge_val
 
     # --- GLOBAL CONSTANTS & VALIDATION ---
     REQUIRED_TYPES = {
-        'Form_import': 'Form Import',
+        'Form_import': 'Form Import Đối tượng',
+        'Form_import_cap': 'Form Import Cáp',
         'thiet_ke': 'Thiết kế',
         'doi_tuong': 'BBNT Đối tượng',
         'TUYEN_CAP': 'BBNT Tuyến cáp',
@@ -439,37 +569,29 @@ def main():
         
         # --- TEMPLATE DOWNLOAD SECTION (COLLAPSIBLE) ---
         with st.expander("📥 Tải Template mẫu", expanded=False):
-            t_col1, t_col2, t_col3 = st.columns(3)
-            with t_col1:
-                template_path = "Templates/02_temp_bang_thiet_ke.xlsx"
-                if os.path.exists(template_path):
-                    with open(template_path, "rb") as f:
+            t_col_main, t_col_empty = st.columns([1, 1])
+            with t_col_main:
+                # File gộp mới
+                template_combined = "Templates/01_2_temp_thiet_ke_import.xlsx"
+                if os.path.exists(template_combined):
+                    with open(template_combined, "rb") as f:
                         st.download_button(
-                            label="📄 Template Thiết kế",
+                            label="📄 Template Thiết kế & Import",
                             data=f,
-                            file_name="Template_Thiet_Ke.xlsx",
+                            file_name="Template_Thiet_Ke_Import.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
-                else: st.error("Lỗi: Mất file Thiết kế")
-            with t_col2:
-                template_import = "Templates/01_temp_formimport.xlsx"
-                if os.path.exists(template_import):
-                    with open(template_import, "rb") as f:
-                        st.download_button(
-                            label="📄 Template Import (Gpon)",
-                            data=f,
-                            file_name="Template_Import_Gpon.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
+                else: 
+                    st.error("⚠️ Lỗi: Không tìm thấy file Template gộp trong thư mục Templates")
             
+            st.markdown("<br>", unsafe_allow_html=True)
             t_bbnt1, t_bbnt2, t_bbnt3, t_bbnt4 = st.columns(4)
             bbnt_templates = [
-                ("03_HNI.I.U.PP.050325.13_BBNT_DT.xlsx", "📄 BBNT Đối tượng", "Template_BBNT_DoiTuong.xlsx"),
-                ("05_HNI.I.U.PP.050325.13_BBNT_TuyenCap.xlsx", "📄 BBNT Tuyến cáp", "Template_BBNT_TuyenCap.xlsx"),
-                ("04_HNI.I.U.PP.050325.13_BBNT_HanNoi.xlsx", "📄 BBNT Hàn nối", "Template_BBNT_HanNoi.xlsx"),
-                ("06_HNI.I.U.PP.050325.13_BBNT_VatTu.xlsx", "📄 BBNT Vật tư", "Template_BBNT_VatTu.xlsx")
+                ("03_HNI.I.M.PP.181225.37_BBNT_DT.xlsx", "📄 BBNT Đối tượng", "Template_BBNT_DoiTuong.xlsx"),
+                ("05_HNI.I.M.PP.181225.37_BBNT_TuyenCap.xlsx", "📄 BBNT Tuyến cáp", "Template_BBNT_TuyenCap.xlsx"),
+                ("04_HNI.I.M.PP.181225.37_BBNT_HanNoi.xlsx", "📄 BBNT Hàn nối", "Template_BBNT_HanNoi.xlsx"),
+                ("06_HNI.I.M.PP.181225.37_BBNT_VatTu.xlsx", "📄 BBNT Vật tư", "Template_BBNT_VatTu.xlsx")
             ]
             cols_bbnt = [t_bbnt1, t_bbnt2, t_bbnt3, t_bbnt4]
             for i, (fname, label, outname) in enumerate(bbnt_templates):
@@ -510,11 +632,8 @@ def main():
                 st.warning("⚠️ Đã phát hiện một số file trùng tên. Hệ thống tự động lọc và chỉ giữ lại 1 bản cho mỗi tên file.")
 
             for f in filtered_files:
-                fn = f.name.lower()
-                if 'thiet_ke' in fn or 'thiết kế' in fn or 'form' in fn or 'design' in fn:
-                    f_d.append(f)
-                else:
-                    f_b.append(f)
+                # Không phân loại cứng dựa trên tên nữa, cho vào một rổ để đọc nội dung
+                f_d.append(f)
             
             progress_bar.progress(10, text="⏳ 10% — Phân loại file...")
             time.sleep(0.05)
@@ -527,6 +646,7 @@ def main():
             # --- STRICT VALIDATION BEFORE RERUN ---
             p_types = set(st.session_state['data_bucket']['map_d'].keys()) | set(st.session_state['data_bucket']['map_b'].keys())
             req_keys = ['Form_import', 'thiet_ke', 'doi_tuong', 'TUYEN_CAP', 'han_noi', 'vat_tu']
+            # Chấp nhận cả nếu có Form_import_cap (nhưng không bắt buộc để chặn rerun nếu user chưa có file cáp mới)
             missing = [k for k in req_keys if k not in p_types]
             
             if not missing:
@@ -571,6 +691,7 @@ def main():
     # Retrieve DFs
     df_std_tk = map_d.get('thiet_ke', pd.DataFrame())
     df_imp = map_d.get('Form_import', map_d.get('doi_tuong', pd.DataFrame()))
+    df_imp_cap = map_d.get('Form_import_cap', pd.DataFrame())
     
     df_tk_cap = map_d.get('TUYEN_CAP', df_std_tk if not df_std_tk.empty else pd.DataFrame())
     df_tk_han = map_d.get('han_noi', df_std_tk if not df_std_tk.empty else pd.DataFrame())
@@ -584,7 +705,6 @@ def main():
     df_bbnt_han = map_b.get('han_noi', pd.DataFrame())
     df_bbnt_vt = map_b.get('vat_tu', pd.DataFrame())
 
-
     all_errors, errors_dict = [], {}
     
     # --- PERFORMANCE OPTIMIZATION: CACHE ANALYSIS RESULTS ---
@@ -592,8 +712,8 @@ def main():
         if st.session_state.get('recalculate_results', True):
             # Calculate Results only if all files are present
             res_doi_tuong = qa.check_doi_tuong(df_imp, df_bbnt_dt, df_std_tk)
-            res_tuyen_cap = qa.check_tuyen_cap(df_tk_cap, df_bbnt_cap)
-            res_han_noi = qa.check_han_noi(df_tk_han, df_bbnt_han)
+            res_tuyen_cap = qa.check_tuyen_cap(df_tk_cap, df_bbnt_cap, df_imp_cap)
+            res_han_noi = qa.check_han_noi(df_tk_han, df_bbnt_han, df_imp)
             res_vat_tu = qa.check_vat_tu(df_bbnt_vt, df_bbnt_dt, df_bbnt_cap)
             res_design_cap = qa.check_design_capacity(df_imp, df_std_tk)
             
@@ -612,6 +732,51 @@ def main():
             res_vat_tu = st.session_state['analysis_results'].get('vat_tu', pd.DataFrame())
             res_design_cap = st.session_state['analysis_results'].get('design_cap', pd.DataFrame())
 
+        # --- MERGE USER NOTES FROM BRIDGE ---
+        user_notes_json = st.session_state.get('_user_notes_data', '')
+        if user_notes_json and len(user_notes_json) > 2:
+            try:
+                import json as _json_parser
+                user_notes_dict = _json_parser.loads(user_notes_json)
+                
+                def merge_notes(df, tab_key):
+                    if df.empty or tab_key not in user_notes_dict: return df
+                    df_c = df.copy()
+                    notes = user_notes_dict[tab_key]
+                    for idx_str, note_val in notes.items():
+                        try:
+                            # idx from JS is 1-based, matching our Excel/Display index
+                            idx_int = int(idx_str)
+                            # Find the row where index (STT) matches
+                            # Since we reset index to 1..N elsewhere, let's be safe
+                            if idx_int <= len(df_c):
+                                df_c.iloc[idx_int-1, df_c.columns.get_loc("Ghi chú")] = note_val
+                        except: pass
+                    return df_c
+                
+                res_doi_tuong = merge_notes(res_doi_tuong, 'dt')
+                res_tuyen_cap = merge_notes(res_tuyen_cap, 'tc')
+                res_han_noi = merge_notes(res_han_noi, 'hn')
+                res_vat_tu = merge_notes(res_vat_tu, 'vt')
+            except: pass
+
+        # --- APPLY MANUAL HN HIGHLIGHTS ---
+        hn_hl_val = st.session_state.get('_hn_hl_data', '')
+        if hn_hl_val and len(hn_hl_val) > 2:
+            try:
+                import json as _j_hn
+                hn_idxs = _j_hn.loads(hn_hl_val)
+                for h_idx in hn_idxs:
+                    i_h = int(h_idx)
+                    if i_h <= len(res_han_noi):
+                         res_han_noi.iloc[i_h-1, res_han_noi.columns.get_loc("Trạng thái Lỗi")] = '❌ Lỗi thực tế'
+            except: pass
+
+        # Clean-up NaN in Ghi chú for display
+        for df in [res_doi_tuong, res_tuyen_cap, res_han_noi, res_vat_tu]:
+            if not df.empty and "Ghi chú" in df.columns:
+                df["Ghi chú"] = df["Ghi chú"].replace(["nan", "NaN", "None"], "").fillna("")
+
         def collect_err(df, cat):
             if df.empty: return
             mask = pd.Series([False] * len(df), index=df.index)
@@ -622,10 +787,7 @@ def main():
             try:
                 emoji_mask = pd.Series([False] * len(df), index=df.index)
                 for c in df.columns:
-                    if cat == "DoiTuong" and c == "Kiểm tra Vị trí":
-                        emoji_mask |= df[c].astype(str).str.contains("❌", na=False)
-                    else:
-                        emoji_mask |= df[c].astype(str).str.contains("❌|⚠️", na=False)
+                    emoji_mask |= df[c].astype(str).str.contains("❌|⚠️", na=False)
                 mask |= emoji_mask
             except: pass
             if mask.any():
@@ -643,47 +805,129 @@ def main():
         # Reset results if files missing
         res_doi_tuong, res_tuyen_cap, res_han_noi, res_vat_tu, res_design_cap = [pd.DataFrame()] * 5
         st.session_state['recalculate_results'] = True
-
-    def to_excel_multiple_sheets(dfs):
+    
+    def to_excel_multiple_sheets(dfs, filter_errors_only=False, include_warnings=False, pre_rows=None):
          output = BytesIO()
-         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+         if pre_rows is None: pre_rows = {}
+         with pd.ExcelWriter(output, engine='xlsxwriter', engine_kwargs={'options': {'nan_inf_to_errors': True}}) as writer:
              workbook = writer.book
+             # Styles
              wrap_format = workbook.add_format({'text_wrap': True, 'valign': 'vcenter'})
              normal_format = workbook.add_format({'valign': 'vcenter'})
-             
-             # Prepare highlight format for manual sheet
              highlight_format = workbook.add_format({'bg_color': '#ffeeb2', 'font_color': '#995c00', 'bold': True, 'valign': 'vcenter'})
+             error_format = workbook.add_format({'bg_color': '#fee2e2', 'font_color': '#b91c1c', 'valign': 'vcenter'})
+             warn_format = workbook.add_format({'bg_color': '#fef9c3', 'font_color': '#854d0e', 'valign': 'vcenter'})
+             ok_format = workbook.add_format({'bg_color': '#dcfce7', 'font_color': '#166534', 'valign': 'vcenter'})
+             summary_format = workbook.add_format({'bold': True, 'font_size': 12, 'valign': 'vcenter'})
              
              for sheet_name, df in dfs.items():
                  df_out = df.copy()
+                 
+                 # Kiểm tra nếu là sheet dữ liệu gốc thì không phân loại/lọc lỗi
+                 is_raw = "Goc" in str(sheet_name) or "Gốc" in str(sheet_name)
+                 
+                 # Add classification column for easier filtering in Excel
+                 def classify(row):
+                     rs = " ".join(row.astype(str))
+                     st = str(row.get('Trạng thái Lỗi', ''))
+                     if '❌' in rs or any(x in st for x in ['Lệch', 'Thiếu', 'Thừa', 'Quá tải', 'Lỗi']):
+                         return "🔴 LỖI"
+                     if '⚠️' in rs or 'Cảnh báo' in st:
+                         return "🟡 CẢNH BÁO"
+                     if '✅' in rs or 'Khớp' in st:
+                         return "🟢 ĐẠT"
+                     return "⚪ KHÁC"
+                 
+                 if len(df_out) > 0 and not is_raw:
+                     df_out.insert(0, 'Phân loại', df_out.apply(classify, axis=1))
+ 
                  for c in df_out.columns:
                      if "SL" in c and df_out[c].dtype in ['float64', 'float32']:
                          df_out[c] = df_out[c].round(1)
                  
-                 # Drop 'Hạng mục' if it exists, since it's redundant in sheet name
                  if 'Hạng mục' in df_out.columns:
                      df_out = df_out.drop(columns=['Hạng mục'])
                  
-                 df_out.to_excel(writer, sheet_name=sheet_name, index=False)
-                 df = df_out
+                 # Write summary rows if provided
+                 start_row = 0
+                 if sheet_name in pre_rows:
+                     # Create worksheet explicitly to write pre-rows
+                     worksheet = workbook.add_worksheet(sheet_name)
+                     writer.sheets[sheet_name] = worksheet
+                     for txt in pre_rows[sheet_name]:
+                         worksheet.write(start_row, 0, txt, summary_format)
+                         start_row += 1
+                 
+                 df_out.to_excel(writer, sheet_name=sheet_name, index=False, startrow=start_row)
                  worksheet = writer.sheets[sheet_name]
                  
-                 is_manual_sheet = str(sheet_name).strip() == "Han noi soat"
-                 highlight_cols = ["Mối hàn từ hàn nối", "Đối tượng từ hàn nối"]
+                 # Apply cell-level formatting based on content
+                 for row_idx in range(len(df_out)):
+                     row_data = df_out.iloc[row_idx]
+                     row_str = " ".join(row_data.astype(str))
+                     status_val = str(row_data.get('Trạng thái Lỗi', ''))
+                     
+                     is_err_row = ('❌' in row_str or any(x in status_val for x in ['Lệch', 'Thiếu', 'Thừa', 'Cảnh báo', 'Quá tải', 'Lỗi']))
+                     is_ok_row = ('✅' in row_str or 'Khớp' in status_val)
+                     
+                     colorable_cols = [
+                         "Kiểm tra Vị trí", 
+                         "Check Công suất/Mở port", 
+                         "Dung lượng (Thiết kế/Import)", 
+                         "Mã hộp (Thiết kế/Import)",
+                         "Dung lượng (TT/TK)", 
+                         "Loại (TT/TK)", 
+                         "Chiều dài (TT/TK)", 
+                         "Trạng thái Lỗi"
+                     ]
+                     
+                     for col_idx, col_name in enumerate(df_out.columns):
+                         val = str(row_data[col_idx])
+                         cell_fmt = normal_format
+                         
+                         if not is_raw and col_name in colorable_cols:
+                             if '❌' in val:
+                                 cell_fmt = error_format
+                             elif '⚠️' in val:
+                                 cell_fmt = warn_format
+                             elif '✅' in val:
+                                 cell_fmt = ok_format
+                             elif col_name == 'Trạng thái Lỗi':
+                                 if is_err_row: 
+                                     if '⚠️' in val or 'Cảnh báo' in val: cell_fmt = warn_format
+                                     else: cell_fmt = error_format
+                                 elif is_ok_row: cell_fmt = ok_format
+                             elif val.strip() != '' and val.strip() != 'nan' and val.strip() != '-':
+                                 cell_fmt = ok_format
+                         
+                         # Overwrite cell with both value and the specific format
+                         val_to_write = row_data[col_idx]
+                         if pd.isna(val_to_write):
+                             val_to_write = ""
+                         worksheet.write(row_idx + start_row + 1, col_idx, val_to_write, cell_fmt)
+                     
+                     if filter_errors_only and not is_raw:
+                         is_err = str(row_data[0]) == "🔴 LỖI"
+                         is_warn = str(row_data[0]) == "🟡 CẢNH BÁO"
+                         if not is_err and not (include_warnings and is_warn):
+                             worksheet.set_row(row_idx + start_row + 1, options={'hidden': True})
+ 
+                 # Enable AutoFilter
+                 worksheet.autofilter(start_row, 0, len(df_out) + start_row, len(df_out.columns) - 1)
+                 if filter_errors_only and not is_raw:
+                     _f_c = 'x == "🔴 LỖI"'
+                     if include_warnings: _f_c += ' or x == "🟡 CẢNH BÁO"'
+                     worksheet.filter_column(0, _f_c)
                  
-                 for i, col in enumerate(df.columns):
-                     if i == len(df.columns) - 1:
-                         # Cột cuối cùng: Cố định 45 và Wrap text
+                 for i, col in enumerate(df_out.columns):
+                     if i == len(df_out.columns) - 1:
                          worksheet.set_column(i, i, 45, wrap_format)
-                     elif is_manual_sheet and str(col) in highlight_cols:
-                         max_len = max(df[col].astype(str).map(len).max(), len(str(col))) + 2
-                         if pd.isna(max_len): max_len = 15
-                         worksheet.set_column(i, i, min(max_len, 35), highlight_format)
                      else:
-                         max_len = max(df[col].astype(str).map(len).max(), len(str(col))) + 2
+                         max_len = max(df_out[col].astype(str).map(len).max(), len(str(col))) + 2
                          if pd.isna(max_len): max_len = 15
                          worksheet.set_column(i, i, min(max_len, 35), normal_format)
          return output.getvalue()
+
 
 
     # --- PAGE 2: KẾT QUẢ PHÂN TÍCH ---
@@ -698,7 +942,7 @@ def main():
             
         st.title("📊 Kết quả Phân tích")
             
-        t1, t2, t3, t4, t5 = st.tabs(["📦 Đối tượng", "🔗 Tuyến cáp", "⚡ Hàn nối", "🛠 Vật tư", "⚡ Hàn nối soát theo phối"])
+        t1, t2, t3, t4 = st.tabs(["📦 Đối tượng", "🔗 Tuyến cáp", "⚡ Hàn nối", "🛠 Vật tư"])
         
         def render_tab(tab, df, name):
             with tab:
@@ -717,8 +961,8 @@ def main():
                     # Logic 2: Reset Index to start from 1 (STT)
                     df.index = range(1, len(df) + 1)
                     
-                    # Logic 3: Selective Styling for Word Wrap
-                    wrap_cols = [c for c in df.columns if c in ["Kiểm tra Vị trí", "Chi tiết", "Tên vật tư"]]
+                    # Logic 3: Selective Styling for Word Wrap & Newlines
+                    wrap_cols = [c for c in df.columns if any(x in c for x in ["Chi tiết", "Tên vật tư", "Ghi chú"])]
                     nowrap_cols = [c for c in df.columns if c not in wrap_cols]
                     
                     if 'Trạng thái Lỗi' in df.columns:
@@ -728,7 +972,7 @@ def main():
                         
                     styled_df = styled_df.set_properties(subset=nowrap_cols, **{'white-space': 'nowrap', 'width': '1%', 'overflow': 'hidden'})
                     if wrap_cols:
-                        styled_df = styled_df.set_properties(subset=wrap_cols, **{'white-space': 'normal', 'word-wrap': 'break-word', 'min-width': '200px'})
+                        styled_df = styled_df.set_properties(subset=wrap_cols, **{'white-space': 'pre-wrap', 'word-wrap': 'break-word', 'min-width': '250px'})
 
                     # Style headers specifically to ensure columns shrink-to-fit
                     th_styles = []
@@ -761,6 +1005,7 @@ def main():
             else:
                 res_doi_tuong.index = range(1, len(res_doi_tuong) + 1)
                 import json as _json_dt
+                upload_id = st.session_state.get('upload_session_id', 'default_session_id')
                 
                 # Convert dataframe to list of dicts for JS
                 dt_rows = []
@@ -768,14 +1013,75 @@ def main():
                     dt_rows.append({
                         "idx": idx,
                         "doi_tuong": str(row.get("Đối tượng", "")),
-                        "vi_tri": str(row.get("Kiểm tra Vị trí", "")),
                         "power": str(row.get("Check Công suất/Mở port", "")),
                         "dung_luong": str(row.get("Dung lượng (Thiết kế/Import)", "")),
                         "ma_hop": str(row.get("Mã hộp (Thiết kế/Import)", "")),
-                        "chi_tiet": str(row.get("Chi tiết", ""))
+                        "chi_tiet": str(row.get("Chi tiết Lỗi khác", "")),
+                        "ghi_chu": str(row.get("Ghi chú", ""))
                     })
                 dt_json = _json_dt.dumps(dt_rows, ensure_ascii=False)
                 
+                
+                tong_dt_tk = 0
+                tk_valid_keys = []
+                if len(df_std_tk.columns) > 7:
+                    col_obj_tk = df_std_tk.columns[0]
+                    for _, row in df_std_tk.iterrows():
+                        val_h = row.iloc[7] if len(row) > 7 else pd.NA
+                        if pd.notna(val_h) and str(val_h).strip() != "":
+                            tong_dt_tk += 1
+                            raw_obj = str(row[col_obj_tk]).strip()
+                            if raw_obj and raw_obj.lower() != 'nan':
+                                key = raw_obj.split('-')[0].strip()
+                                key = qa._normalize_text(key)
+                                tk_valid_keys.append(key)
+                
+                tong_dt_tc = len(res_doi_tuong)
+                
+                def format_short_node_dt(name):
+                    name = str(name).strip()
+                    if '.' in name:
+                        name = name.split('.')[-1]
+                    parts = name.split('/')
+                    if parts[0]:
+                        parts[0] = parts[0].lstrip('0')
+                    return '/'.join(parts)
+                
+                diff_text = ""
+                bbnt_keys = res_doi_tuong['Đối tượng'].dropna().apply(lambda x: str(x).split('-')[0].strip()).apply(qa._normalize_text).tolist()
+                
+                if tong_dt_tc > tong_dt_tk:
+                    tk_keys_temp = tk_valid_keys.copy()
+                    thua_raw = []
+                    for k in bbnt_keys:
+                        if k in tk_keys_temp:
+                            tk_keys_temp.remove(k)
+                        else:
+                            thua_raw.append(k)
+                    if thua_raw:
+                        thua_items = []
+                        for k in thua_raw:
+                            short_k = format_short_node_dt(k)
+                            if short_k not in thua_items:
+                                thua_items.append(short_k)
+                        diff_text = f", Đối tượng thừa so thiết kế: {', '.join(thua_items)}"
+                        
+                elif tong_dt_tc < tong_dt_tk:
+                    bbnt_keys_temp = bbnt_keys.copy()
+                    thieu_raw = []
+                    for k in tk_valid_keys:
+                        if k in bbnt_keys_temp:
+                            bbnt_keys_temp.remove(k)
+                        else:
+                            thieu_raw.append(k)
+                    if thieu_raw:
+                        thieu_items = []
+                        for k in thieu_raw:
+                            short_k = format_short_node_dt(k)
+                            if short_k not in thieu_items:
+                                thieu_items.append(short_k)
+                        diff_text = f", Đối tượng thiếu so thiết kế: {', '.join(thieu_items)}"
+
                 dt_html = f"""
                 <!DOCTYPE html>
                 <html>
@@ -787,6 +1093,7 @@ def main():
                         width: 100%;
                         border-collapse: collapse;
                         margin-top: 5px;
+                        table-layout: fixed;
                     }}
                     table.dt-table th {{
                         background-color: #f6f8fa;
@@ -800,6 +1107,7 @@ def main():
                         top: 0;
                         z-index: 10;
                         white-space: nowrap;
+                        overflow: hidden;
                     }}
                     table.dt-table th.sortable {{
                         cursor: pointer;
@@ -813,20 +1121,33 @@ def main():
                         padding: 8px 10px;
                         text-align: center;
                         vertical-align: middle;
-                        white-space: nowrap;
+                        white-space: pre-wrap; /* For newlines */
+                        word-wrap: break-word;
                     }}
-                    table.dt-table td.row-num {{
-                        background-color: #f6f8fa;
-                        color: #656d76;
-                        font-weight: 500;
-                        width: 40px;
-                        text-align: center;
+                    /* Column widths */
+                    table.dt-table th:nth-child(1), table.dt-table td:nth-child(1) {{ width: 40px; }}
+                    table.dt-table th:nth-child(2), table.dt-table td:nth-child(2) {{ width: 140px; text-align: left; }}
+                    .clamp-3 {{
+                        display: -webkit-box;
+                        -webkit-line-clamp: 3;
+                        -webkit-box-orient: vertical;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                        line-height: 1.4em;
+                        max-height: 4.2em;
                     }}
+                    table.dt-table th:nth-child(3), table.dt-table td:nth-child(3),
+                    table.dt-table th:nth-child(4), table.dt-table td:nth-child(4),
+                    table.dt-table th:nth-child(5), table.dt-table td:nth-child(5) {{
+                        width: 120px;
+                        white-space: normal;
+                        word-wrap: break-word;
+                    }}
+                    /* Cột 8,9: Chi tiết & Ghi chú - tự co giãn theo không gian còn lại */
                     table.dt-table td.chi-tiet {{
                         text-align: left;
                         white-space: normal;
                         word-wrap: break-word;
-                        min-width: 250px;
                     }}
                     table.dt-table tr {{ transition: background-color 0.15s; }}
                     table.dt-table tr:hover {{ background-color: #f0f4ff !important; }}
@@ -837,17 +1158,22 @@ def main():
                 </style>
                 </head>
                 <body>
-                <p class="dt-hint">💡 Click vào <b>Tiêu đề cột (Đối tượng)</b> để sắp xếp. Tiêu đề được cố định khi cuộn.</p>
+                <p class="dt-hint"><b>Tổng đối tượng thiết kế: {tong_dt_tk}, Tổng đối tượng thi công: {tong_dt_tc}{diff_text}</b></p>
                 <table class="dt-table">
                     <thead>
                         <tr>
                             <th>#</th>
-                            <th class="sortable" id="sort-doi_tuong">Đối tượng <span class="sort-icon">⇅</span></th>
-                            <th>Kiểm tra Vị trí</th>
+                            <th class="sortable" id="sort-doi_tuong">
+                                Đối tượng <span class="sort-icon">⇅</span>
+                                <div style="margin-top: 5px;">
+                                    <input type="text" id="dt-search" placeholder="Tìm..." style="width: 100%; padding: 4px; border: 1px solid #d0d7de; border-radius: 4px; font-weight: normal; font-size: 11px;">
+                                </div>
+                            </th>
                             <th>Check Công suất/Mở port</th>
                             <th>Dung lượng (Thiết kế/Import)</th>
                             <th>Mã hộp (Thiết kế/Import)</th>
-                            <th>Chi tiết</th>
+                            <th>Chi tiết Lỗi khác</th>
+                            <th style="min-width: 150px;">Ghi chú (Nhập mới)</th>
                         </tr>
                     </thead>
                     <tbody id="dt-body"></tbody>
@@ -856,10 +1182,12 @@ def main():
                 <script>
                     let dtData = {dt_json};
                     let currentSort = {{ column: null, direction: 'asc' }};
+                    let searchTerm = '';
                     
                     function getSortValue(val) {{
                         if (!val) return "";
-                        const str = String(val);
+                        // Remove markers for sorting
+                        let str = String(val).replace(/[✅❌⚠️]\s*/g, '');
                         const dotIdx = str.indexOf('.');
                         const slashIdx = str.indexOf('/');
                         if (dotIdx !== -1 && slashIdx !== -1 && dotIdx < slashIdx) {{
@@ -890,11 +1218,20 @@ def main():
                     }}
 
                     document.getElementById('sort-doi_tuong').addEventListener('click', () => handleSort('doi_tuong'));
+                    document.getElementById('dt-search').addEventListener('input', (e) => {{
+                        searchTerm = e.target.value.toLowerCase();
+                        renderTable();
+                    }});
+                    document.getElementById('dt-search').addEventListener('click', (e) => e.stopPropagation());
                     
                     function renderTable() {{
+                        restoreNotes();
                         const tbody = document.getElementById('dt-body');
                         
                         let dataToRender = [...dtData];
+                        if (searchTerm) {{
+                            dataToRender = dataToRender.filter(r => String(r.doi_tuong).toLowerCase().includes(searchTerm));
+                        }}
                         if (currentSort.column) {{
                             dataToRender.sort((a, b) => {{
                                 const valA = getSortValue(a[currentSort.column]);
@@ -914,29 +1251,86 @@ def main():
                         dataToRender.forEach(r => {{
                             const tr = document.createElement('tr');
                             
-                            // Highlight logic: Skip red for "Lệch nhẹ" if no other critical errors
-                            const allContent = r.doi_tuong + r.vi_tri + r.power + r.dung_luong + r.ma_hop + r.chi_tiet;
-                            const hasCrit = allContent.includes('❌') || 
-                                          ((allContent.includes('⚠️') || allContent.includes('Lệch')) && !r.vi_tri.includes('Lệch nhẹ'));
-                            
-                            if (hasCrit) {{
-                                tr.classList.add('err-row');
-                            }} else if (allContent.includes('✅') || allContent.includes('Khớp') || r.vi_tri.includes('Lệch nhẹ')) {{
-                                tr.classList.add('ok-row');
+                            // Row statuses for fallback
+                            const allContent = r.doi_tuong + r.power + r.dung_luong + r.ma_hop + r.chi_tiet;
+                            const isErrRow = allContent.includes('❌') || 
+                                           ((allContent.includes('⚠️') || allContent.includes('Lệch')) );
+                            const isOkRow = allContent.includes('✅') || allContent.includes('Khớp');
+
+                            function getCellClass(val, isStatusCol = false) {{
+                                let v = String(val);
+                                if (v.includes('❌')) return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                if (v.includes('⚠️')) return 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+                                if (v.includes('✅')) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                if (isStatusCol) {{
+                                    if (isErrRow) {{
+                                        if (v.includes('⚠️')) return 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+                                        return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                    }}
+                                    if (isOkRow) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                }}
+                                if (v.trim() !== '' && v.toLowerCase() !== 'nan' && v !== '-') {{
+                                    return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                }}
+                                return '';
                             }}
-                            
+
                             tr.innerHTML = `
                                 <td class="row-num">${{r.idx}}</td>
                                 <td>${{r.doi_tuong}}</td>
-                                <td>${{r.vi_tri}}</td>
-                                <td>${{r.power}}</td>
-                                <td>${{r.dung_luong}}</td>
-                                <td>${{r.ma_hop}}</td>
+                                <td ${{getCellClass(r.power)}}>${{r.power}}</td>
+                                <td ${{getCellClass(r.dung_luong)}}>${{r.dung_luong}}</td>
+                                <td ${{getCellClass(r.ma_hop)}}>${{r.ma_hop}}</td>
                                 <td class="chi-tiet">${{r.chi_tiet}}</td>
+                                <td class="chi-tiet editable-cell" contenteditable="true" data-idx="${{r.idx}}" data-tab="dt">${{r.ghi_chu}}</td>
                             `;
                             tbody.appendChild(tr);
                         }});
                     }}
+                    function saveUserNote(tab, idx, val) {{
+                        const key = "user_notes_" + "{upload_id}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (!notes[tab]) notes[tab] = {{}};
+                        notes[tab][idx] = val;
+                        localStorage.setItem(key, JSON.stringify(notes));
+                    }}
+
+                    function syncNotesToBridge() {{
+                        const key = "user_notes_" + "{upload_id}";
+                        const data = localStorage.getItem(key);
+                        if (!data) return;
+                        
+                        const parentDoc = window.parent.document;
+                        const target = Array.from(parentDoc.querySelectorAll('input')).find(i =>
+                            i.getAttribute('aria-label') === 'GhiChu_Bridge'
+                        );
+                        if (target && target.value !== data) {{
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                            setter.call(target, data);
+                            target.focus();
+                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            target.blur();
+                        }}
+                    }}
+
+                    function restoreNotes() {{
+                        const key = "user_notes_" + "{upload_id}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (notes['dt']) {{
+                            dtData.forEach(r => {{
+                                if (notes['dt'][r.idx]) r.ghi_chu = notes['dt'][r.idx];
+                            }});
+                        }}
+                    }}
+
+                    document.getElementById('dt-body').addEventListener('input', (e) => {{
+                        if (e.target.classList.contains('editable-cell')) {{
+                            saveUserNote('dt', e.target.dataset.idx, e.target.innerText.trim());
+                        }}
+                    }});
+
+                    restoreNotes();
                     renderTable();
                 </script>
                 </body>
@@ -947,12 +1341,12 @@ def main():
                 fn_dt = f"Result_DoiTuong_{datetime.now().strftime('%H%M')}.xlsx"
                 st.download_button("📥 Tải Excel", to_excel(res_doi_tuong), fn_dt, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        
         # --- Tab Tuyến cáp: Interactive Row Selection ---
         with t2:
             if res_tuyen_cap.empty:
                 st.info("Chưa có kết quả (Thiếu dữ liệu đầu vào).")
             else:
+                # Basic reconciliation logic (Excel only)
                 res_tuyen_cap.index = range(1, len(res_tuyen_cap) + 1)
                 import json as _json_tc
                 _upload_id_tc = st.session_state.get('upload_session_id', 'default_session_id')
@@ -969,10 +1363,84 @@ def main():
                         "loai": str(row.get("Loại (TT/TK)", "")),
                         "chieu_dai": str(row.get("Chiều dài (TT/TK)", "")),
                         "trang_thai": str(row.get("Trạng thái Lỗi", "")),
-                        "chi_tiet": str(row.get("Chi tiết", ""))
+                        "chi_tiet": str(row.get("Chi tiết", "")),
+                        "ghi_chu": str(row.get("Ghi chú", ""))
                     })
                 tc_json = _json_tc.dumps(tc_rows, ensure_ascii=False)
                 
+                total_design_len = qa.calculate_total_design_length(df_tk_cap)
+                total_construction_count = len(res_tuyen_cap)
+                
+                def format_short_node(name):
+                    name = str(name).strip()
+                    if '.' in name:
+                        name = name.split('.')[-1]
+                    parts = name.split('/')
+                    if parts[0]:
+                        parts[0] = parts[0].lstrip('0')
+                    return '/'.join(parts)
+                
+                diff_text = ""
+                # 1. Parse valid TK keys
+                col = qa._find_column(df_tk_cap, ["Số lượng", "Chiều dài"])
+                if not col and len(df_tk_cap.columns) > 4:
+                    col = df_tk_cap.columns[4]
+                
+                tk_valid_keys = []
+                col_obj_tk = qa._find_column(df_tk_cap, ["Tên đối tượng", "Đối tượng"])
+                if not col_obj_tk and len(df_tk_cap.columns) > 0:
+                    col_obj_tk = df_tk_cap.columns[0]
+                    
+                if col and col_obj_tk:
+                    for _, row in df_tk_cap.iterrows():
+                        val = row[col]
+                        if pd.isna(val): continue
+                        digits = "".join(filter(str.isdigit, str(val).strip()))
+                        if digits:
+                            raw_obj = row[col_obj_tk]
+                            key = str(raw_obj).split('-')[0].strip()
+                            key = qa._normalize_text(key)
+                            tk_valid_keys.append(key)
+                
+                # 2. Parse valid BBNT keys
+                bbnt_keys = res_tuyen_cap['Điểm cuối (Key)'].dropna().tolist()
+                
+                if total_construction_count > total_design_len:
+                    # Find thua
+                    tk_keys_temp = tk_valid_keys.copy()
+                    thua_raw = []
+                    for k in bbnt_keys:
+                        if k in tk_keys_temp:
+                            tk_keys_temp.remove(k)
+                        else:
+                            thua_raw.append(k)
+                    
+                    if thua_raw:
+                        thua_items = []
+                        for k in thua_raw:
+                            short_k = format_short_node(k)
+                            if short_k not in thua_items:
+                                thua_items.append(short_k)
+                        diff_text = f", Tuyến thừa so thiết kế: {', '.join(thua_items)}"
+                        
+                elif total_construction_count < total_design_len:
+                    # Find thieu
+                    bbnt_keys_temp = bbnt_keys.copy()
+                    thieu_raw = []
+                    for k in tk_valid_keys:
+                        if k in bbnt_keys_temp:
+                            bbnt_keys_temp.remove(k)
+                        else:
+                            thieu_raw.append(k)
+                            
+                    if thieu_raw:
+                        thieu_items = []
+                        for k in thieu_raw:
+                            short_k = format_short_node(k)
+                            if short_k not in thieu_items:
+                                thieu_items.append(short_k)
+                        diff_text = f", Tuyến thiếu so thiết kế: {', '.join(thieu_items)}"
+
                 tc_html = f"""
                 <!DOCTYPE html>
                 <html>
@@ -998,6 +1466,11 @@ def main():
                         z-index: 10;
                         white-space: nowrap;
                     }}
+                    table.tc-table th:nth-child(7), table.tc-table td:nth-child(7) {{
+                        width: 180px;
+                        white-space: normal;
+                        word-wrap: break-word;
+                    }}
                     table.tc-table th.sortable {{
                         cursor: pointer;
                         user-select: none;
@@ -1021,12 +1494,19 @@ def main():
                     }}
                     table.tc-table td.chi-tiet {{
                         text-align: left;
-                        white-space: normal;
+                        white-space: pre-wrap;
                         word-wrap: break-word;
-                        min-width: 200px;
+                        min-width: 250px;
                     }}
-                    table.tc-table tr {{ cursor: pointer; transition: background-color 0.15s; }}
-                    table.tc-table tr:hover {{ background-color: #f0f4ff !important; }}
+                    table.tc-table td.clickable-hl {{
+                        cursor: pointer;
+                    }}
+                    table.tc-table td.clickable-hl:hover {{
+                        color: #1e40af;
+                        background-color: #eff6ff !important;
+                    }}
+                    table.tc-table tr {{ transition: background-color 0.15s; }}
+                    table.tc-table tr:hover {{ background-color: #f8fafc; }}
                     table.tc-table tr.highlighted {{ background-color: #ffeeb2 !important; }}
                     table.tc-table tr.highlighted:hover {{ background-color: #ffe080 !important; }}
                     table.tc-table tr.err-row {{ background-color: #ffe0e0; }}
@@ -1038,19 +1518,24 @@ def main():
                 </style>
                 </head>
                 <body>
-                <p class="tc-hint">💡 <b>Click vào hàng</b> để bôi vàng các tuyến sai điểm đầu thiết kế. Click vào <b>Tiêu đề cột</b> (Tuyến cáp, Điểm đầu, Điểm cuối) để sắp xếp.</p>
+                <p class="tc-hint">💡 <b>Click vào hàng</b> để bôi vàng các tuyến sai điểm đầu thiết kế. <b>Nhập điểm cuối</b> và đối chiếu với phối cáp. Nếu tìm duy nhất 1 vị trí sẽ tô xanh để nhận diện đã đối chiếu</p>
+                <p class="tc-hint"><b>Tổng tuyến thiết kế: {total_design_len}, Tổng tuyến thi công: {total_construction_count}{diff_text}</b></p>
                 <table class="tc-table">
                     <thead>
                         <tr>
                             <th>#</th>
                             <th class="sortable" id="sort-tuyen_cap">Tuyến cáp <span class="sort-icon">⇅</span></th>
                             <th class="sortable" id="sort-diem_dau">Điểm đầu <span class="sort-icon">⇅</span></th>
-                            <th class="sortable" id="sort-diem_cuoi">Điểm cuối (Key) <span class="sort-icon">⇅</span></th>
+                            <th class="sortable" id="sort-diem_cuoi">
+                                Điểm cuối (Key) <span class="sort-icon">⇅</span>
+                                <input type="text" id="search-diem_cuoi" placeholder="Tìm..." style="width: 100%; margin-top: 5px; padding: 4px; border: 1px solid #d0d7de; border-radius: 4px; font-weight: normal; font-size: 12px; display: block;">
+                            </th>
                             <th>Dung lượng (TT/TK)</th>
                             <th>Loại (TT/TK)</th>
                             <th>Chiều dài (TT/TK)</th>
                             <th>Trạng thái Lỗi</th>
                             <th>Chi tiết</th>
+                            <th style="min-width: 150px;">Ghi chú (Nhập mới)</th>
                         </tr>
                     </thead>
                     <tbody id="tc-body"></tbody>
@@ -1060,16 +1545,42 @@ def main():
                     let tcData = {tc_json};
                     const storageKey = "tc_highlighted_{_upload_id_tc}";
                     let currentSort = {{ column: null, direction: 'asc' }};
+                    let searchTerm = "";
+                    
+                    // Filter input logic
+                    function setupSearchListener() {{
+                        const searchInput = document.getElementById('search-diem_cuoi');
+                        if (searchInput) {{
+                            searchInput.addEventListener('input', (e) => {{
+                                searchTerm = e.target.value.toLowerCase();
+                                renderTable();
+                            }});
+                            searchInput.addEventListener('click', (e) => e.stopPropagation());
+                            searchInput.addEventListener('keydown', (e) => {{
+                                if (e.key === 'Enter') {{
+                                    e.preventDefault();
+                                    searchInput.value = "";
+                                    searchTerm = "";
+                                    renderTable();
+                                }}
+                            }});
+                        }}
+                    }}
                     
                     // Load highlighted rows from localStorage
                     let highlightedSet = new Set();
+                    let foundPointsSet = new Set();
                     try {{
-                        const saved = localStorage.getItem(storageKey);
-                        if (saved) highlightedSet = new Set(JSON.parse(saved));
+                        const savedHL = localStorage.getItem(storageKey);
+                        if (savedHL) highlightedSet = new Set(JSON.parse(savedHL));
+                        
+                        const savedFound = localStorage.getItem("tc_found_points_{_upload_id_tc}");
+                        if (savedFound) foundPointsSet = new Set(JSON.parse(savedFound));
                     }} catch(e) {{}}
                     
-                    function saveHighlighted() {{
+                    function saveState() {{
                         localStorage.setItem(storageKey, JSON.stringify([...highlightedSet]));
+                        localStorage.setItem("tc_found_points_{_upload_id_tc}", JSON.stringify([...foundPointsSet]));
                         syncToBridge();
                     }}
                     
@@ -1092,8 +1603,11 @@ def main():
                                             dung_luong: r.dung_luong,
                                             loai: r.loai,
                                             chieu_dai: r.chieu_dai,
+                                            cad_diem_dau: r.cad_diem_dau,
+                                            cad_check: r.cad_check,
                                             trang_thai: r.trang_thai,
-                                            chi_tiet_orig: r.chi_tiet
+                                            chi_tiet_orig: r.chi_tiet,
+                                            ghi_chu: r.ghi_chu
                                         }});
                                     }}
                                 }});
@@ -1104,7 +1618,8 @@ def main():
 
                     function getSortValue(val) {{
                         if (!val) return "";
-                        const str = String(val);
+                        // Remove markers for sorting
+                        let str = String(val).replace(/[✅❌⚠️]\s*/g, '');
                         // Lấy phần giữa dấu . và dấu /
                         const dotIdx = str.indexOf('.');
                         const slashIdx = str.indexOf('/');
@@ -1143,9 +1658,17 @@ def main():
                     document.getElementById('sort-diem_cuoi').addEventListener('click', () => handleSort('diem_cuoi'));
                     
                     function renderTable() {{
+                        restoreNotes();
                         const tbody = document.getElementById('tc-body');
                         
                         let dataToRender = [...tcData];
+                        
+                        // Apply filter
+                        if (searchTerm) {{
+                            dataToRender = dataToRender.filter(r => r.diem_cuoi.toLowerCase().includes(searchTerm));
+                        }}
+                        
+                        // Apply sort
                         if (currentSort.column) {{
                             dataToRender.sort((a, b) => {{
                                 const valA = getSortValue(a[currentSort.column]);
@@ -1162,47 +1685,135 @@ def main():
                             }});
                         }}
 
+                        const singleResult = dataToRender.length === 1 && searchTerm !== "";
+                        if (singleResult) {{
+                            const foundIdx = dataToRender[0].idx;
+                            if (!foundPointsSet.has(foundIdx)) {{
+                                foundPointsSet.add(foundIdx);
+                                saveState();
+                            }}
+                        }}
+
                         tbody.innerHTML = '';
                         dataToRender.forEach(r => {{
                             const tr = document.createElement('tr');
                             const isHL = highlightedSet.has(r.idx);
                             
+                            // Row statuses for fallback
+                            const isErrRow = r.trang_thai.includes('❌') || r.trang_thai.includes('Sai') || r.trang_thai.includes('Lệch');
+                            const isOkRow = r.trang_thai.includes('✅') || r.trang_thai.includes('Khớp');
+
+                             function getCellClass(val, isStatusCol = false) {{
+                                if (isHL) return ''; // Manual priority
+                                let v = String(val);
+                                if (v.includes('❌')) return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                if (v.includes('⚠️')) return 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+                                if (v.includes('✅')) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                if (isStatusCol) {{
+                                    if (isErrRow) {{
+                                        if (v.includes('⚠️')) return 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+                                        return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                    }}
+                                    if (isOkRow) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                }}
+                                if (v.trim() !== '' && v.toLowerCase() !== 'nan' && v !== '-') {{
+                                    return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                }}
+                                return '';
+                            }}
+
                             if (isHL) tr.classList.add('highlighted');
-                            else if (r.trang_thai.includes('❌') || r.trang_thai.includes('Sai') || r.trang_thai.includes('Lệch')) tr.classList.add('err-row');
-                            else if (r.trang_thai.includes('✅') || r.trang_thai.includes('Khớp')) tr.classList.add('ok-row');
-                            
+
                             let chiTiet = r.chi_tiet || '';
                             if (isHL) {{
                                 chiTiet = chiTiet ? chiTiet + '; Sai điểm đầu' : 'Sai điểm đầu';
                             }}
                             
+                            // Highlight "Diem Dau" if only one result OR previously found
+                            const isFound = foundPointsSet.has(r.idx);
+                            const diemDauStyle = isFound 
+                                ? 'class="ok-cell" style="background-color: #4ade80 !important; color: #064e3b !important; font-weight: bold;"' 
+                                : '';
+
+                            let cadCheckClass = '';
+                            if (r.cad_check === 'Khớp') cadCheckClass = 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                            else if (r.cad_check === 'Lệch') cadCheckClass = 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                            else if (r.cad_check === 'Không tìm thấy điểm đầu trong CAD') cadCheckClass = 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+
                             tr.innerHTML = `
                                 <td class="row-num">${{r.idx}}</td>
-                                <td>${{r.tuyen_cap}}</td>
-                                <td>${{r.diem_dau}}</td>
-                                <td>${{r.diem_cuoi}}</td>
-                                <td>${{r.dung_luong}}</td>
-                                <td>${{r.loai}}</td>
-                                <td>${{r.chieu_dai}}</td>
-                                <td>${{r.trang_thai}}</td>
+                                <td class="clickable-hl">${{r.tuyen_cap}}</td>
+                                <td class="clickable-hl" ${{diemDauStyle}}>${{r.diem_dau}}</td>
+                                <td class="clickable-hl">${{r.diem_cuoi}}</td>
+                                <td ${{getCellClass(r.dung_luong)}}>${{r.dung_luong}}</td>
+                                <td ${{getCellClass(r.loai)}}>${{r.loai}}</td>
+                                <td ${{getCellClass(r.chieu_dai)}}>${{r.chieu_dai}}</td>
+                                <td ${{getCellClass(r.trang_thai, true)}}>${{r.trang_thai}}</td>
                                 <td class="chi-tiet">${{chiTiet}}</td>
+                                <td class="chi-tiet editable-cell" contenteditable="true" data-idx="${{r.idx}}" data-tab="tc" onclick="event.stopPropagation()" onmousedown="event.stopPropagation()">${{r.ghi_chu}}</td>
                             `;
                             
                             tr.addEventListener('click', (e) => {{
-                                // Prevent toggle if clicking on a button or something (though there aren't any)
-                                if (highlightedSet.has(r.idx)) {{
-                                    highlightedSet.delete(r.idx);
-                                }} else {{
-                                    highlightedSet.add(r.idx);
+                                if (e.target.classList.contains('clickable-hl')) {{
+                                    if (highlightedSet.has(r.idx)) {{
+                                        highlightedSet.delete(r.idx);
+                                    }} else {{
+                                        highlightedSet.add(r.idx);
+                                    }}
+                                    saveState();
+                                    renderTable();
                                 }}
-                                saveHighlighted();
-                                renderTable();
                             }});
                             
                             tbody.appendChild(tr);
                         }});
                     }}
                     
+                    function saveUserNote(tab, idx, val) {{
+                        const key = "user_notes_" + "{_upload_id_tc}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (!notes[tab]) notes[tab] = {{}};
+                        notes[tab][idx] = val;
+                        localStorage.setItem(key, JSON.stringify(notes));
+                    }}
+
+                    function syncNotesToBridge() {{
+                        const key = "user_notes_" + "{_upload_id_tc}";
+                        const data = localStorage.getItem(key);
+                        if (!data) return;
+                        
+                        const parentDoc = window.parent.document;
+                        const target = Array.from(parentDoc.querySelectorAll('input')).find(i =>
+                            i.getAttribute('aria-label') === 'GhiChu_Bridge'
+                        );
+                        if (target && target.value !== data) {{
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                            setter.call(target, data);
+                            target.focus();
+                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            target.blur();
+                        }}
+                    }}
+
+                    function restoreNotes() {{
+                        const key = "user_notes_" + "{_upload_id_tc}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (notes['tc']) {{
+                            tcData.forEach(r => {{
+                                if (notes['tc'][r.idx]) r.ghi_chu = notes['tc'][r.idx];
+                            }});
+                        }}
+                    }}
+
+                    document.getElementById('tc-body').addEventListener('input', (e) => {{
+                        if (e.target.classList.contains('editable-cell')) {{
+                            saveUserNote('tc', e.target.dataset.idx, e.target.innerText.trim());
+                        }}
+                    }});
+
+                    restoreNotes();
+                    setupSearchListener();
                     renderTable();
                     syncToBridge();
                 </script>
@@ -1221,25 +1832,25 @@ def main():
             else:
                 res_han_noi.index = range(1, len(res_han_noi) + 1)
                 import json as _json_hn
+                upload_id = st.session_state.get('upload_session_id', 'default_session_id')
                 
                 # Convert dataframe to list of dicts for JS
                 hn_rows = []
                 for idx, row in res_han_noi.iterrows():
-                    # Format as int string per request
-                    sl_tk = row.get("SL Thiết kế", 0)
-                    sl_tt = row.get("SL Thực tế", 0)
-                    sl_tk_str = str(int(sl_tk)) if sl_tk == int(sl_tk) else f"{sl_tk:g}"
-                    sl_tt_str = str(int(sl_tt)) if sl_tt == int(sl_tt) else f"{sl_tt:g}"
-                    
                     hn_rows.append({
                         "idx": idx,
                         "vi_tri": str(row.get("Vị trí", "")),
-                        "sl_tk": sl_tk_str,
-                        "sl_tt": sl_tt_str,
+                        "sl_tk": str(row.get("SL Thiết kế", "")),
+                        "sl_tt": str(row.get("SL đề nghị", "")),
                         "trang_thai": str(row.get("Trạng thái Lỗi", "")),
-                        "chi_tiet": str(row.get("Chi tiết", ""))
+                        "chi_tiet": str(row.get("Chi tiết", "")),
+                        "ghi_chu": str(row.get("Ghi chú", ""))
                     })
                 hn_json = _json_hn.dumps(hn_rows, ensure_ascii=False)
+                
+                # Calculate totals for weld tab
+                sum_dn = int(res_han_noi['SL đề nghị'].astype(float).fillna(0).sum()) if 'SL đề nghị' in res_han_noi.columns else 0
+                sum_tk = int(res_han_noi['SL Thiết kế'].astype(float).fillna(0).sum()) if 'SL Thiết kế' in res_han_noi.columns else 0
                 
                 hn_html = f"""
                 <!DOCTYPE html>
@@ -1266,13 +1877,6 @@ def main():
                         z-index: 10;
                         white-space: nowrap;
                     }}
-                    table.hn-table th.sortable {{
-                        cursor: pointer;
-                        user-select: none;
-                    }}
-                    table.hn-table th.sortable:hover {{
-                        background-color: #ebf0f5;
-                    }}
                     table.hn-table td {{
                         border: 1px solid #d0d7de;
                         padding: 8px 10px;
@@ -1289,29 +1893,60 @@ def main():
                     }}
                     table.hn-table td.chi-tiet {{
                         text-align: left;
-                        white-space: normal;
+                        white-space: pre-wrap;
                         word-wrap: break-word;
                         min-width: 250px;
                     }}
-                    table.hn-table tr {{ transition: background-color 0.15s; }}
-                    table.hn-table tr:hover {{ background-color: #f0f4ff !important; }}
-                    table.hn-table tr.err-row {{ background-color: #ffe0e0; }}
-                    table.hn-table tr.ok-row {{ background-color: #e6f9e6; }}
+                    table.hn-table tr {{ background-color: white; transition: background-color 0.15s; }}
+                    table.hn-table tr:hover {{ background-color: #f8fafc !important; }}
+                    
+                    /* Cột Vị trí styles */
+                    table.hn-table td.clickable-hl {{ cursor: pointer; text-decoration: none; border-left: 3px solid transparent; }}
+                    table.hn-table td.clickable-hl:hover {{ background-color: #f0f4ff !important; }}
+                    
+                    /* Màu xanh: Đã tìm thấy qua search (duy nhất) */
+                    table.hn-table td.found-green {{ background-color: #dcfce7 !important; color: #15803d !important; font-weight: bold; }}
+                    
+                    /* Màu vàng: Đã click kiểm tra */
+                    table.hn-table td.checked-yellow {{ background-color: #fef9c3 !important; color: #a16207 !important; font-weight: bold; border-left: 3px solid #eab308 !important; }}
+                    
+                    /* Cột Vị trí tự co theo dữ liệu */
+                    table.hn-table th:nth-child(2), table.hn-table td:nth-child(2) {{
+                        width: 1%;
+                        white-space: nowrap;
+                    }}
+
                     .hn-hint {{ font-size: 13px; color: #555; margin-bottom: 8px; }}
                     .sort-icon {{ font-size: 11px; margin-left: 5px; opacity: 0.6; }}
+                    .search-container {{ margin-top: 6px; padding: 0 4px; }}
+                    .vi-tri-search {{
+                        width: 120px;
+                        padding: 5px 8px;
+                        font-size: 12px;
+                        border: 1px solid #d1d5db;
+                        border-radius: 4px;
+                        font-weight: normal;
+                    }}
                 </style>
                 </head>
                 <body>
-                <p class="hn-hint">💡 Click vào <b>Tiêu đề cột (Vị trí)</b> để sắp xếp. Tiêu đề được cố định khi cuộn.</p>
+                <p class="hn-hint">💡 <b>Nhập mối hàn</b> và đối chiếu phối cáp. Nếu tìm duy nhất 1 vị trí sẽ tô xanh để nhận diện đã đối chiếu</p>
+                <p class="hn-hint"><b>Tổng đề nghị: {sum_dn}, Tổng thiết kế: {sum_tk}</b></p>
                 <table class="hn-table">
                     <thead>
                         <tr>
                             <th>#</th>
-                            <th class="sortable" id="sort-vi_tri">Vị trí <span class="sort-icon">⇅</span></th>
+                            <th class="sortable" id="sort-vi_tri">
+                                Vị trí <span class="sort-icon">⇅</span>
+                                <div class="search-container">
+                                    <input type="text" id="vi-tri-search" class="vi-tri-search" placeholder="Tìm..." onclick="event.stopPropagation()">
+                                </div>
+                            </th>
+                            <th>SL đề nghị</th>
                             <th>SL Thiết kế</th>
-                            <th>SL Thực tế</th>
                             <th>Trạng thái Lỗi</th>
                             <th>Chi tiết</th>
+                            <th>Ghi chú (Nhập mới)</th>
                         </tr>
                     </thead>
                     <tbody id="hn-body"></tbody>
@@ -1320,16 +1955,27 @@ def main():
                 <script>
                     let hnData = {hn_json};
                     let currentSort = {{ column: null, direction: 'asc' }};
+                    let searchTerm = '';
+                    let highlightedSet = new Set();
+                    let foundSet = new Set();
                     
+                    const HL_KEY = "hn_manual_hl_" + "{upload_id}";
+                    const FOUND_KEY = "hn_found_" + "{upload_id}";
+                    
+                    function saveState() {{
+                        localStorage.setItem(HL_KEY, JSON.stringify([...highlightedSet]));
+                        localStorage.setItem(FOUND_KEY, JSON.stringify([...foundSet]));
+                    }}
+                    function restoreState() {{
+                        const hSaved = localStorage.getItem(HL_KEY);
+                        if (hSaved) highlightedSet = new Set(JSON.parse(hSaved));
+                        const fSaved = localStorage.getItem(FOUND_KEY);
+                        if (fSaved) foundSet = new Set(JSON.parse(fSaved));
+                    }}
+
                     function getSortValue(val) {{
                         if (!val) return "";
-                        const str = String(val);
-                        const dotIdx = str.indexOf('.');
-                        const slashIdx = str.indexOf('/');
-                        if (dotIdx !== -1 && slashIdx !== -1 && dotIdx < slashIdx) {{
-                            return str.substring(dotIdx + 1, slashIdx);
-                        }}
-                        return str;
+                        return String(val).replace(/[✅❌⚠️]\s*/g, '');
                     }}
 
                     function handleSort(col) {{
@@ -1353,12 +1999,20 @@ def main():
                         renderTable();
                     }}
 
-                    document.getElementById('sort-vi_tri').addEventListener('click', () => handleSort('vi_tri'));
-                    
                     function renderTable() {{
+                        restoreNotes();
+                        restoreState();
                         const tbody = document.getElementById('hn-body');
                         
                         let dataToRender = [...hnData];
+                        
+                        if (searchTerm) {{
+                            const s = searchTerm.toLowerCase();
+                            dataToRender = dataToRender.filter(r => 
+                                String(r.vi_tri).toLowerCase().includes(s)
+                            );
+                        }}
+
                         if (currentSort.column) {{
                             dataToRender.sort((a, b) => {{
                                 const valA = getSortValue(a[currentSort.column]);
@@ -1368,43 +2022,161 @@ def main():
                                 if (!isNaN(numA) && !isNaN(numB)) {{
                                     return currentSort.direction === 'asc' ? numA - numB : numB - numA;
                                 }}
-                                return currentSort.direction === 'asc' 
-                                    ? valA.localeCompare(valB) 
-                                    : valB.localeCompare(valA);
+                                return currentSort.direction === 'asc' ? String(valA).localeCompare(String(valB)) : String(valB).localeCompare(String(valA));
                             }});
                         }}
 
+                        if (searchTerm.trim() !== '' && dataToRender.length === 1) {{
+                            foundSet.add(dataToRender[0].idx);
+                            saveState();
+                        }}
+
                         tbody.innerHTML = '';
+                        
                         dataToRender.forEach(r => {{
                             const tr = document.createElement('tr');
+                            const isHL = highlightedSet.has(r.idx);
+                            const displayedStatus = isHL ? "❌ Lỗi thực tế" : r.trang_thai;
                             
-                            // Highlight logic
-                            if (r.trang_thai.includes('❌') || r.trang_thai.includes('Lệch')) {{
-                                tr.classList.add('err-row');
-                            }} else if (r.trang_thai.includes('✅') || r.trang_thai.includes('Khớp')) {{
-                                tr.classList.add('ok-row');
-                            }}
+                            const getStatusCellClass = (v) => {{
+                                if (v.includes('❌')) return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                if (v.includes('✅')) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                return '';
+                            }};
+
+                            let viTriClass = "clickable-hl";
+                            if (isHL) viTriClass += " checked-yellow";
+                            else if (r.trang_thai.includes('Trùng vị trí')) viTriClass += " err-cell";
+                            else if (foundSet.has(r.idx)) viTriClass += " found-green";
                             
                             tr.innerHTML = `
                                 <td class="row-num">${{r.idx}}</td>
-                                <td>${{r.vi_tri}}</td>
-                                <td>${{r.sl_tk}}</td>
+                                <td class="${{viTriClass}}">${{r.vi_tri}}</td>
                                 <td>${{r.sl_tt}}</td>
-                                <td>${{r.trang_thai}}</td>
+                                <td>${{r.sl_tk}}</td>
+                                <td ${{getStatusCellClass(displayedStatus)}}>${{displayedStatus}}</td>
                                 <td class="chi-tiet">${{r.chi_tiet}}</td>
+                                <td class="chi-tiet editable-cell" contenteditable="true" data-idx="${{r.idx}}" data-tab="hn">${{r.ghi_chu}}</td>
                             `;
+
+                            const clickable = tr.querySelector('.clickable-hl');
+                            if (clickable) {{
+                                clickable.addEventListener('click', (e) => {{
+                                    e.stopPropagation();
+                                    if (highlightedSet.has(r.idx)) {{
+                                        highlightedSet.delete(r.idx);
+                                        if (r.ghi_chu === "kiểm tra mối hàn") {{
+                                            r.ghi_chu = "";
+                                            saveUserNote('hn', r.idx, "");
+                                        }}
+                                    }} else {{
+                                        highlightedSet.add(r.idx);
+                                        if (!r.ghi_chu || r.ghi_chu.trim() === '') {{
+                                            r.ghi_chu = "kiểm tra mối hàn";
+                                            saveUserNote('hn', r.idx, r.ghi_chu);
+                                        }}
+                                    }}
+                                    saveState();
+                                    renderTable();
+                                }});
+                            }}
+
                             tbody.appendChild(tr);
                         }});
                     }}
+
+                    function saveUserNote(tab, idx, val) {{
+                        const key = "user_notes_" + "{upload_id}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (!notes[tab]) notes[tab] = {{}};
+                        notes[tab][idx] = val;
+                        localStorage.setItem(key, JSON.stringify(notes));
+                    }}
+
+                    function syncNotesToBridge() {{
+                        const key = "user_notes_" + "{upload_id}";
+                        const data = localStorage.getItem(key);
+                        const hlKey = "hn_manual_hl_" + "{upload_id}";
+                        const hls = localStorage.getItem(hlKey) || "[]";
+                        
+                        const parentDoc = window.parent.document;
+                        
+                        // Sync Notes
+                        const target = Array.from(parentDoc.querySelectorAll('input')).find(i =>
+                            i.getAttribute('aria-label') === 'GhiChu_Bridge'
+                        );
+                        if (target && target.value !== data) {{
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                            setter.call(target, data);
+                            target.focus();
+                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            target.blur();
+                        }}
+                        
+                        // Sync Highlights
+                        const hnTarget = Array.from(parentDoc.querySelectorAll('input')).find(i =>
+                            i.getAttribute('aria-label') === 'HN_Bridge'
+                        );
+                        if (hnTarget && hnTarget.value !== hls) {{
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                            setter.call(hnTarget, hls);
+                            hnTarget.focus();
+                            hnTarget.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            hnTarget.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            hnTarget.blur();
+                        }}
+                    }}
+
+                    function restoreNotes() {{
+                        const key = "user_notes_" + "{upload_id}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (notes['hn']) {{
+                            hnData.forEach(r => {{
+                                if (notes['hn'][r.idx]) r.ghi_chu = notes['hn'][r.idx];
+                            }});
+                        }}
+                    }}
+
+                    document.getElementById('hn-body').addEventListener('input', (e) => {{
+                        if (e.target.classList.contains('editable-cell')) {{
+                            saveUserNote('hn', e.target.dataset.idx, e.target.innerText.trim());
+                        }}
+                    }});
+
+                    // Filter input logic
+                    function setupSearchListener() {{
+                        const searchInput = document.getElementById('vi-tri-search');
+                        if (searchInput) {{
+                            searchInput.addEventListener('input', (e) => {{
+                                searchTerm = e.target.value.toLowerCase();
+                                renderTable();
+                            }});
+                            searchInput.addEventListener('click', (e) => e.stopPropagation());
+                            searchInput.addEventListener('keydown', (e) => {{
+                                if (e.key === 'Enter') {{
+                                    e.preventDefault();
+                                    searchInput.value = "";
+                                    searchTerm = "";
+                                    renderTable();
+                                }}
+                            }});
+                        }}
+                    }}
+
+                    restoreNotes();
+                    restoreState();
+                    setupSearchListener();
                     renderTable();
                 </script>
+
                 </body>
                 </html>
                 """
                 st.components.v1.html(hn_html, height=620, scrolling=True)
                 
                 fn_hn = f"Result_HanNoi_{datetime.now().strftime('%H%M')}.xlsx"
-                st.download_button("📥 Tải Excel", to_excel(res_han_noi), fn_hn, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button("📥 Tải Excel", to_excel(res_han_noi, pre_rows=[f"Tổng đề nghị: {sum_dn}, Tổng thiết kế: {sum_tk}"]), fn_hn, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         # --- Tab Vật tư: Interactive Sort & Sticky Header ---
         with t4:
@@ -1413,25 +2185,22 @@ def main():
             else:
                 res_vat_tu.index = range(1, len(res_vat_tu) + 1)
                 import json as _json_vt
+                upload_id = st.session_state.get('upload_session_id', 'default_session_id')
                 
                 # Convert dataframe to list of dicts for JS
                 vt_rows = []
                 for idx, row in res_vat_tu.iterrows():
-                    # Format quantities as integers if possible
-                    sl_tk = row.get("SL Thiết kế", 0)
-                    sl_nt = row.get("SL Nghiệm thu", 0)
-                    sl_tk_str = str(int(sl_tk)) if sl_tk == int(sl_tk) else f"{sl_tk:g}"
-                    sl_nt_str = str(int(sl_nt)) if sl_nt == int(sl_nt) else f"{sl_nt:g}"
-                    
                     vt_rows.append({
                         "idx": idx,
+                        "kho": str(row.get("Kho", "")),
                         "ma_vt": str(row.get("Mã vật tư", "")),
                         "ten_vt": str(row.get("Tên vật tư", "")),
                         "tinh_trang": str(row.get("Tình trạng hàng", "")),
-                        "sl_tk": sl_tk_str,
-                        "sl_nt": sl_nt_str,
+                        "sl_tk": str(row.get("SL đối chiếu", "")),
+                        "sl_nt": str(row.get("SL Nghiệm thu", "")),
                         "trang_thai": str(row.get("Trạng thái Lỗi", "")),
-                        "chi_tiet": str(row.get("Chi tiết", ""))
+                        "chi_tiet": str(row.get("Chi tiết", "")),
+                        "ghi_chu": str(row.get("Ghi chú", ""))
                     })
                 vt_json = _json_vt.dumps(vt_rows, ensure_ascii=False)
                 
@@ -1496,18 +2265,25 @@ def main():
                 </style>
                 </head>
                 <body>
-                <p class="vt-hint">💡 Click vào <b>Tiêu đề cột (Mã vật tư, Tên vật tư)</b> để sắp xếp. Tiêu đề được cố định khi cuộn.</p>
+                <p class="vt-hint">💡 <b>SL đối chiếu</b> = Tổng SL thực tế (Cột J) file Đối tượng + Tổng SL thực tế (Cột E) file Tuyến cáp theo Mã Vật Tư.</p>
                 <table class="vt-table">
                     <thead>
                         <tr>
                             <th>#</th>
+                            <th class="sortable" id="sort-kho">Kho <span class="sort-icon">⇅</span></th>
                             <th class="sortable" id="sort-ma_vt">Mã vật tư <span class="sort-icon">⇅</span></th>
-                            <th class="sortable" id="sort-ten_vt">Tên vật tư <span class="sort-icon">⇅</span></th>
+                            <th class="sortable" id="sort-ten_vt">
+                                Tên vật tư <span class="sort-icon">⇅</span>
+                                <div style="margin-top: 5px;">
+                                    <input type="text" id="vt-search" placeholder="Tìm..." style="width: 100%; padding: 4px; border: 1px solid #d0d7de; border-radius: 4px; font-weight: normal; font-size: 11px;">
+                                </div>
+                            </th>
                             <th>Tình trạng hàng</th>
-                            <th>SL Thiết kế</th>
+                            <th>SL đối chiếu</th>
                             <th>SL Nghiệm thu</th>
                             <th>Trạng thái Lỗi</th>
                             <th>Chi tiết</th>
+                            <th>Ghi chú (Nhập mới)</th>
                         </tr>
                     </thead>
                     <tbody id="vt-body"></tbody>
@@ -1515,8 +2291,15 @@ def main():
                 
                 <script>
                     let vtData = {vt_json};
-                    let currentSort = {{ column: null, direction: 'asc' }};
+                    let currentSort = {{ column: 'kho', direction: 'asc' }};
+                    let searchTerm = '';
                     
+                    function getSortValue(val) {{
+                        if (!val) return "";
+                        // Remove markers for sorting
+                        return String(val).replace(/[✅❌⚠️]\s*/g, '');
+                    }}
+
                     function handleSort(col) {{
                         if (currentSort.column === col) {{
                             currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
@@ -1526,7 +2309,7 @@ def main():
                         }}
                         
                         // Update UI icons
-                        ['ma_vt', 'ten_vt'].forEach(id => {{
+                        ['kho', 'ma_vt', 'ten_vt'].forEach(id => {{
                             const el = document.getElementById('sort-' + id);
                             const icon = el.querySelector('.sort-icon');
                             if (id === col) {{
@@ -1541,30 +2324,41 @@ def main():
                         renderTable();
                     }}
 
+                    document.getElementById('sort-kho').addEventListener('click', () => handleSort('kho'));
                     document.getElementById('sort-ma_vt').addEventListener('click', () => handleSort('ma_vt'));
                     document.getElementById('sort-ten_vt').addEventListener('click', () => handleSort('ten_vt'));
+                    document.getElementById('vt-search').addEventListener('input', (e) => {{
+                        searchTerm = e.target.value.toLowerCase();
+                        renderTable();
+                    }});
+                    document.getElementById('vt-search').addEventListener('click', (e) => e.stopPropagation());
                     
                     function renderTable() {{
+                        restoreNotes();
                         const tbody = document.getElementById('vt-body');
                         
                         let dataToRender = [...vtData];
+                        if (searchTerm) {{
+                            dataToRender = dataToRender.filter(r => 
+                                String(r.ten_vt).toLowerCase().includes(searchTerm) || 
+                                String(r.kho).toLowerCase().includes(searchTerm)
+                            );
+                        }}
                         if (currentSort.column) {{
                             dataToRender.sort((a, b) => {{
-                                const valA = String(a[currentSort.column]).toLowerCase();
-                                const valB = String(b[currentSort.column]).toLowerCase();
+                                const valA = getSortValue(a[currentSort.column]);
+                                const valB = getSortValue(b[currentSort.column]);
                                 
-                                // Try numeric sort for Mã vật tư if they are digits
-                                if (currentSort.column === 'ma_vt') {{
-                                    const numA = parseInt(valA);
-                                    const numB = parseInt(valB);
-                                    if (!isNaN(numA) && !isNaN(numB)) {{
-                                        return currentSort.direction === 'asc' ? numA - numB : numB - numA;
-                                    }}
+                                // Try numeric sort if they can be numbers
+                                const numA = parseFloat(valA);
+                                const numB = parseFloat(valB);
+                                if (!isNaN(numA) && !isNaN(numB)) {{
+                                    return currentSort.direction === 'asc' ? numA - numB : numB - numA;
                                 }}
                                 
                                 return currentSort.direction === 'asc' 
-                                    ? valA.localeCompare(valB) 
-                                    : valB.localeCompare(valA);
+                                    ? String(valA).toLowerCase().localeCompare(String(valB).toLowerCase()) 
+                                    : String(valB).toLowerCase().localeCompare(String(valA).toLowerCase());
                             }});
                         }}
 
@@ -1572,26 +2366,88 @@ def main():
                         dataToRender.forEach(r => {{
                             const tr = document.createElement('tr');
                             
-                            // Highlight logic
-                            if (r.trang_thai.includes('❌') || r.trang_thai.includes('Lệch')) {{
-                                tr.classList.add('err-row');
-                            }} else if (r.trang_thai.includes('✅') || r.trang_thai.includes('Khớp')) {{
-                                tr.classList.add('ok-row');
+                            // Row statuses for fallback
+                            const isErrRow = r.trang_thai.includes('❌') || r.trang_thai.includes('Lệch');
+                            const isOkRow = r.trang_thai.includes('✅') || r.trang_thai.includes('Khớp');
+
+                             function getCellClass(val, isStatusCol = false) {{
+                                let v = String(val);
+                                if (v.includes('❌')) return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                if (v.includes('⚠️')) return 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+                                if (v.includes('✅')) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                if (isStatusCol) {{
+                                    if (isErrRow) {{
+                                        if (v.includes('⚠️')) return 'class="warn-cell" style="background-color: #fef9c3; color: #854d0e"';
+                                        return 'class="err-cell" style="background-color: #fee2e2; color: #991b1b"';
+                                    }}
+                                    if (isOkRow) return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                }}
+                                // Non-empty values in OK row or Non-error cells in Err row
+                                if (v.trim() !== '' && v.toLowerCase() !== 'nan' && v !== '-') {{
+                                    return 'class="ok-cell" style="background-color: #dcfce7; color: #166534"';
+                                }}
+                                return '';
                             }}
-                            
+
                             tr.innerHTML = `
                                 <td class="row-num">${{r.idx}}</td>
+                                <td>${{r.kho}}</td>
                                 <td>${{r.ma_vt}}</td>
                                 <td class="ten-vt">${{r.ten_vt}}</td>
                                 <td>${{r.tinh_trang}}</td>
                                 <td>${{r.sl_tk}}</td>
                                 <td>${{r.sl_nt}}</td>
-                                <td>${{r.trang_thai}}</td>
+                                <td ${{getCellClass(r.trang_thai, true)}}>${{r.trang_thai}}</td>
                                 <td class="chi-tiet">${{r.chi_tiet}}</td>
+                                <td class="chi-tiet editable-cell" contenteditable="true" data-idx="${{r.idx}}" data-tab="vt">${{r.ghi_chu}}</td>
                             `;
                             tbody.appendChild(tr);
                         }});
                     }}
+                    function saveUserNote(tab, idx, val) {{
+                        const key = "user_notes_" + "{upload_id}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (!notes[tab]) notes[tab] = {{}};
+                        notes[tab][idx] = val;
+                        localStorage.setItem(key, JSON.stringify(notes));
+                    }}
+
+                    function syncNotesToBridge() {{
+                        const key = "user_notes_" + "{upload_id}";
+                        const data = localStorage.getItem(key);
+                        if (!data) return;
+                        
+                        const parentDoc = window.parent.document;
+                        const target = Array.from(parentDoc.querySelectorAll('input')).find(i =>
+                            i.getAttribute('aria-label') === 'GhiChu_Bridge'
+                        );
+                        if (target && target.value !== data) {{
+                            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                            setter.call(target, data);
+                            target.focus();
+                            target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                            target.blur();
+                        }}
+                    }}
+
+                    function restoreNotes() {{
+                        const key = "user_notes_" + "{upload_id}";
+                        let notes = JSON.parse(localStorage.getItem(key) || "{{}}");
+                        if (notes['vt']) {{
+                            vtData.forEach(r => {{
+                                if (notes['vt'][r.idx]) r.ghi_chu = notes['vt'][r.idx];
+                            }});
+                        }}
+                    }}
+
+                    document.getElementById('vt-body').addEventListener('input', (e) => {{
+                        if (e.target.classList.contains('editable-cell')) {{
+                            saveUserNote('vt', e.target.dataset.idx, e.target.innerText.trim());
+                        }}
+                    }});
+
+                    restoreNotes();
                     renderTable();
                 </script>
                 </body>
@@ -1603,369 +2459,7 @@ def main():
                 st.download_button("📥 Tải Excel", to_excel(res_vat_tu), fn_vt, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-        with t5:
-            # Lấy Session ID để reset bảng nếu up file mới
-            upload_session_id = st.session_state.get('upload_session_id', 'default_session_id')
-            
-            # 1. Trích xuất dữ liệu mảng để JS có thể tra cứu
-            qa_logic_instance = get_qa_logic()
-            lookup_list = []
-            if not res_han_noi.empty:
-                for _, hn_row in res_han_noi.iterrows():
-                    vitri = str(hn_row.get("Vị trí", ""))
-                    if not vitri or vitri.lower() == 'nan': continue
-                    sl_tt = qa_logic_instance._safe_num(hn_row.get("SL Thực tế", 0))
-                    val_tt = str(int(sl_tt)) if sl_tt == int(sl_tt) else str(sl_tt)
-                    lookup_list.append({
-                        "vitri_lower": vitri.lower(),
-                        "vitri": vitri.upper(),
-                        "sl": val_tt
-                    })
-            
-            import json
-            lookup_json = json.dumps(lookup_list)
-            
-            # 2. Tạo Table HTML & JS (Hoạt động offline siêu mượt như Excel thực thụ)
-            html_code = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-            <style>
-                .excel-table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                    font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
-                    margin-top: 10px;
-                }}
-                .excel-table th, .excel-table td {{
-                    border: 1px solid #d0d7de;
-                    padding: 0;
-                    margin: 0;
-                }}
-                .excel-table th {{
-                    background-color: #f6f8fa;
-                    padding: 10px;
-                    text-align: center;
-                    font-weight: 600;
-                    color: #24292f;
-                    font-size: 14px;
-                    position: sticky;
-                    top: 0;
-                    z-index: 10;
-                }}
-                .excel-table td.row-num {{
-                    background-color: #f6f8fa;
-                    text-align: center;
-                    width: 40px;
-                    color: #57606a;
-                    font-size: 14px;
-                }}
-                .cell-input {{
-                    width: 100%;
-                    box-sizing: border-box;
-                    border: none;
-                    padding: 10px;
-                    font-size: 14px;
-                    text-align: center;
-                    outline: none;
-                    background-color: #ffffff;
-                }}
-                .cell-input:focus {{
-                    box-shadow: inset 0 0 0 2px #0969da;
-                    background-color: #f0f7ff;
-                }}
-                .readonly-cell {{
-                    padding: 10px;
-                    font-size: 14px;
-                    color: #24292f;
-                    min-height: 20px;
-                    background-color: #fbfbfb;
-                    white-space: nowrap;
-                    overflow: hidden;
-                    text-align: center;
-                    text-overflow: ellipsis;
-                    cursor: pointer;
-                    user-select: none;
-                }}
-                .not-found {{
-                    color: #cf222e;
-                    font-style: italic;
-                }}
-                .suspicious .readonly-cell{{
-                    background-color: #ffeeb2 !important;
-                    font-weight: bold;
-                    color: #995c00;
-                }}
-            </style>
-            </head>
-            <body style="margin: 0; background: white; padding: 10px;">
-            <p style="font-size: 14px; color: #57606a; margin-top: 0; margin-bottom: 10px;">💡 <b>Hướng dẫn:</b> Nhập mã đối tượng (1, 2, 3 ký tự hộp) vào cột <b>Nhập đối tượng</b> (nhấn Enter để xuống dòng tự động).<br/>Nếu thấy kết quả đáng ngờ, hãy <b>Click 1 lần vào cột Kết quả</b> (Đối tượng từ hàn nối) để bôi vàng. Dữ liệu bôi vàng sẽ được xuất ra ở <b>Tab Số liệu sai lệch</b>.</p>
-            <table class="excel-table" id="manual-table">
-                <thead>
-                    <tr>
-                        <th style="width: 40px; text-align: center;">#</th>
-                        <th style="width: 1%; white-space: nowrap; padding: 10px 20px; text-align: center;">Nhập đối tượng</th>
-                        <th style="width: 1%; white-space: nowrap; padding: 10px 20px; text-align: center;">Mối hàn từ hàn nối</th>
-                        <th style="width: 1%; white-space: nowrap; padding: 10px 20px; text-align: center;">Đối tượng từ hàn nối</th>
-                        <th style="width: auto; text-align: center;">Ghi chú</th>
-                    </tr>
-                </thead>
-                <tbody id="table-body">
-                </tbody>
-            </table>
-            
-            <script>
-                const lookupData = {lookup_json};
-                const uploadSessionId = "{upload_session_id}";
-                const tbody = document.getElementById('table-body');
-                let rowCount = 0;
-                
-                function saveData() {{
-                    let rowsData = [];
-                    document.querySelectorAll('#manual-table tbody tr').forEach((tr) => {{
-                        let inputs = tr.querySelectorAll('input.cell-input');
-                        if (inputs.length === 2 && (inputs[0].value || inputs[1].value || tr.classList.contains('suspicious'))) {{
-                            let hanoi = tr.querySelector('td:nth-child(3) div').innerText;
-                            let obj = tr.querySelector('td:nth-child(4) div').innerText;
-                            rowsData.push({{
-                                idx: parseInt(inputs[0].dataset.row),
-                                input_val: inputs[0].value,
-                                hanoi_val: hanoi,
-                                obj_val: obj,
-                                note_val: inputs[1].value,
-                                suspicious: tr.classList.contains('suspicious')
-                            }});
-                        }}
-                    }});
-                    localStorage.setItem("manual_splicing_" + uploadSessionId, JSON.stringify(rowsData));
-                }}
-                
-                function processInputLogic(inputEl, val, checkDuplicate) {{
-                    const row = parseInt(inputEl.dataset.row);
-                    const hanoiEl = document.getElementById('hanoi-' + row);
-                    const objEl = document.getElementById('obj-' + row);
-                    
-                    if (!val) {{
-                        hanoiEl.innerText = '';
-                        objEl.innerText = '';
-                        objEl.classList.remove('not-found');
-                        return;
-                    }}
-                    
-                    let searchStr = val.toLowerCase();
-                    if (/^\\d+$/.test(val) && val.length <= 4) {{
-                        searchStr = val.padStart(4, '0');
-                    }}
-                    
-                    // Check duplicate
-                    if (checkDuplicate) {{
-                        let isDuplicate = false;
-                        document.querySelectorAll('input.cell-input[data-obj="true"]').forEach(other => {{
-                            if (other !== inputEl && other.value.trim() !== '') {{
-                                let otherVal = other.value.trim().toLowerCase();
-                                let otherSearchStr = otherVal;
-                                if (/^\\d+$/.test(otherVal) && otherVal.length <= 4) {{
-                                    otherSearchStr = otherVal.padStart(4, '0');
-                                }}
-                                if (searchStr === otherSearchStr) {{
-                                    isDuplicate = true;
-                                }}
-                            }}
-                        }});
-                        
-                        if (isDuplicate) {{
-                            alert("Bị trùng! Giá trị '" + val + "' đã được nhập ở vị trí khác.");
-                            inputEl.value = '';
-                            hanoiEl.innerText = '';
-                            objEl.innerText = '';
-                            objEl.classList.remove('not-found');
-                            setTimeout(() => inputEl.focus(), 10);
-                            return;
-                        }}
-                    }}
-                    
-                    let foundItem = lookupData.find(item => item.vitri_lower.includes(searchStr));
-                    
-                    if (foundItem) {{
-                        hanoiEl.innerText = foundItem.sl;
-                        objEl.innerText = foundItem.vitri;
-                        objEl.classList.remove('not-found');
-                    }} else {{
-                        hanoiEl.innerText = '0';
-                        objEl.innerText = 'Không tìm thấy';
-                        objEl.classList.add('not-found');
-                    }}
-                    
-                    if (row === rowCount && val) {{
-                        addRow();
-                    }}
-                }}
-                
-                function addRow() {{
-                    rowCount++;
-                    const tr = document.createElement('tr');
-                    
-                    const tdNum = document.createElement('td');
-                    tdNum.className = 'row-num';
-                    tdNum.innerText = rowCount;
-                    
-                    const tdInput = document.createElement('td');
-                    const input = document.createElement('input');
-                    input.type = 'text';
-                    input.className = 'cell-input';
-                    input.dataset.row = rowCount;
-                    input.dataset.obj = "true";
-                    tdInput.appendChild(input);
-                    
-                    const tdHanoi = document.createElement('td');
-                    const divHanoi = document.createElement('div');
-                    divHanoi.className = 'readonly-cell';
-                    divHanoi.id = 'hanoi-' + rowCount;
-                    tdHanoi.appendChild(divHanoi);
-                    
-                    const tdObj = document.createElement('td');
-                    const divObj = document.createElement('div');
-                    divObj.className = 'readonly-cell';
-                    divObj.id = 'obj-' + rowCount;
-                    divObj.title = "Click để đánh dấu nghi ngờ sai lệch";
-                    tdObj.appendChild(divObj);
-                    
-                    // Click to mark suspicious
-                    divObj.addEventListener('click', function() {{
-                        const trParent = this.closest('tr');
-                        // Chỉ cho phép đánh dấu nếu đã có kết quả (khác trống)
-                        if (this.innerText.trim() !== '') {{
-                            trParent.classList.toggle('suspicious');
-                            saveData();
-                        }}
-                    }});
-                    
-                    const tdNote = document.createElement('td');
-                    const inputNote = document.createElement('input');
-                    inputNote.type = 'text';
-                    inputNote.className = 'cell-input';
-                    inputNote.placeholder = "Nhập ghi chú...";
-                    inputNote.addEventListener('input', saveData);
-                    tdNote.appendChild(inputNote);
-                    
-                    tr.appendChild(tdNum);
-                    tr.appendChild(tdInput);
-                    tr.appendChild(tdHanoi);
-                    tr.appendChild(tdObj);
-                    tr.appendChild(tdNote);
-                    
-                    tbody.appendChild(tr);
-                    
-                    input.addEventListener('input', function(e) {{
-                        processInputLogic(this, e.target.value.trim(), false);
-                        saveData();
-                    }});
-                    
-                    input.addEventListener('change', function(e) {{
-                        processInputLogic(this, e.target.value.trim(), true);
-                        saveData();
-                    }});
-                    
-                    input.addEventListener('keydown', handleArrowKeys);
-                    inputNote.addEventListener('keydown', handleArrowKeys);
-                }}
-                
-                function handleArrowKeys(e) {{
-                    const row = parseInt(this.dataset.row || this.closest('tr').rowIndex);
-                    const isNote = !this.dataset.row;
-                    
-                    if (e.key === 'Enter') {{
-                        e.preventDefault();
-                        // Tìm ô "Nhập đối tượng" trống đầu tiên trong toàn bộ bảng
-                        const allRows = document.querySelectorAll('table.excel-table tbody tr');
-                        let found = false;
-                        for (let i = 0; i < allRows.length; i++) {{
-                            const inp = allRows[i].querySelector('input.cell-input[data-row]');
-                            if (inp && inp.value.trim() === '') {{
-                                inp.focus();
-                                found = true;
-                                break;
-                            }}
-                        }}
-                        if (!found) {{
-                            // Nếu tất cả đã nhập, nhảy đến dòng tiếp theo
-                            const nextTr = document.querySelector('tr:nth-child(' + (row + 1) + ')');
-                            if (nextTr) {{
-                                const inputs = nextTr.querySelectorAll('input.cell-input');
-                                if (inputs[0]) inputs[0].focus();
-                            }}
-                        }}
-                    }} else if (e.key === 'ArrowDown') {{
-                        e.preventDefault();
-                        const nextTr = document.querySelector('tr:nth-child(' + (row + 1) + ')');
-                        if (nextTr) {{
-                            const inputs = nextTr.querySelectorAll('input.cell-input');
-                            if(isNote && inputs[1]) inputs[1].focus();
-                            else if(!isNote && inputs[0]) inputs[0].focus();
-                        }}
-                    }} else if (e.key === 'ArrowUp') {{
-                        e.preventDefault();
-                        if (row > 1) {{
-                            const prevTr = document.querySelector('tr:nth-child(' + (row - 1) + ')');
-                            if (prevTr) {{
-                                const inputs = prevTr.querySelectorAll('input.cell-input');
-                                if(isNote && inputs[1]) inputs[1].focus();
-                                else if(!isNote && inputs[0]) inputs[0].focus();
-                            }}
-                        }}
-                    }}
-                }}
-                
-                function restoreData() {{
-                    let saved = localStorage.getItem("manual_splicing_" + uploadSessionId);
-                    if(saved) {{
-                        try {{
-                            let rowsData = JSON.parse(saved);
-                            if (rowsData.length === 0) {{
-                                if (rowCount === 0) addRow();
-                                return;
-                            }}
-                            
-                            let maxRow = 1;
-                            rowsData.forEach(r => {{ if (r.idx > maxRow) maxRow = r.idx; }});
-                            
-                            while(rowCount < maxRow) {{ addRow(); }}
-                            
-                            rowsData.forEach(rData => {{
-                                let tr = tbody.rows[rData.idx - 1];
-                                if(tr) {{
-                                    let inputs = tr.querySelectorAll('input.cell-input');
-                                    if(inputs.length === 2) {{
-                                        inputs[0].value = rData.input_val || "";
-                                        inputs[1].value = rData.note_val || "";
-                                        if (rData.suspicious) {{
-                                            tr.classList.add('suspicious');
-                                        }} else {{
-                                            tr.classList.remove('suspicious');
-                                        }}
-                                        processInputLogic(inputs[0], rData.input_val || "", false);
-                                    }}
-                                }}
-                            }});
-                            // Add one empty row at the bottom if the last row has data
-                            let lastTr = document.querySelector('tr:nth-child(' + maxRow + ')');
-                            if (lastTr) {{
-                                let inputs = lastTr.querySelectorAll('input.cell-input');
-                                if (inputs[0] && inputs[0].value) addRow();
-                            }}
-                        }} catch(e) {{}}
-                    }} else {{
-                        if (rowCount === 0) addRow();
-                    }}
-                }}
-                
-                restoreData();
-            </script>
-            </body>
-            </html>
-            """
-            # Tăng height lên để người dùng không phải cuộn nhiều bên ngoài cửa sổ con
-            st.components.v1.html(html_code, height=800, scrolling=True)
+
 
     # --- PAGE 3: SỐ LIỆU SAI LỆCH (NEW) ---
     if nav == "Số liệu sai lệch":
@@ -1976,89 +2470,20 @@ def main():
             st.warning("⚠️ Vui lòng upload đầy đủ 6 loại file trước.")
             st.stop()
             
-        # --- READ SUSPICIOUS DATA ---
-        import json as _json
-        suspicious_df = None
-        saved_rows = []
         _upload_id = st.session_state.get('upload_session_id', 'default_session_id')
-        
-        # Đọc dữ liệu từ sidebar bridge (vốn đã được đồng bộ từ Tab 5 qua JS)
-        bridge_data = st.session_state.get('_sync_bridge_data', '')
-        if bridge_data and len(bridge_data) > 2:
-            try:
-                saved_rows = _json.loads(bridge_data)
-            except Exception:
-                pass
-        
-        # Priority 3: Server fallback — JS component that reads localStorage and pushes to bridge
-        if not saved_rows:
-            st.components.v1.html(f"""
-            <script>
-            (function() {{
-                const key = "manual_splicing_{_upload_id}";
-                const saved = localStorage.getItem(key);
-                if (saved && saved !== "[]" && saved.length > 2) {{
-                    const parentDoc = window.parent.document;
-                    const target = Array.from(parentDoc.querySelectorAll('input')).find(i =>
-                        i.getAttribute('aria-label') === 'DataSync_Bridge'
-                    );
-                    if (target && target.value !== saved) {{
-                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-                        setter.call(target, saved);
-                        target.focus();
-                        target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        target.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        target.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }}));
-                        target.blur();
-                    }}
-                }}
-            }})();
-            </script>
-            """, height=0)
-            
-            # Auto-rerun once to pick up the value after JS pushes it
-            if not st.session_state.get('_sai_lech_auto_synced', False):
-                st.session_state['_sai_lech_auto_synced'] = True
-                import time as _time
-                _time.sleep(0.8)  # Wait for JS to execute
-                st.rerun()
-        else:
-            # Reset auto-sync flag when data is present (for next navigation cycle)
-            st.session_state['_sai_lech_auto_synced'] = False
-        
-        # Build suspicious_df from rows marked as suspicious
-        suspicious_list = []
-        for rData in saved_rows:
-            if rData.get('suspicious'):
-                suspicious_list.append({
-                    "Nhập đối tượng": rData.get('input_val', ''),
-                    "Mối hàn từ hàn nối": rData.get('hanoi_val', ''),
-                    "Đối tượng từ hàn nối": rData.get('obj_val', ''),
-                    "Ghi chú": rData.get('note_val', '')
-                })
-        
-        if suspicious_list:
-            suspicious_df = pd.DataFrame(suspicious_list)
-            suspicious_df.index = range(1, len(suspicious_df) + 1)
-            suspicious_df.insert(0, "Hạng mục", "Han noi soat")
-        
-        if suspicious_df is not None and not suspicious_df.empty:
-            errors_dict['Han noi soat'] = suspicious_df
-            all_errors.append(suspicious_df)
-        
+
         # --- READ HIGHLIGHTED TUYẾN CÁP ROWS ---
-        # Use a second hidden bridge to sync tc_errors from localStorage
         st.markdown('<style>div.tc-bridge-wrapper { position: absolute; opacity: 0; height: 0; overflow: hidden; pointer-events: none; } div:has(> div > input[aria-label="TC_Bridge"]) { position: absolute; opacity: 0; height: 0; overflow: hidden; pointer-events: none; }</style>', unsafe_allow_html=True)
         tc_bridge_val = st.text_input("TC_Bridge", key="tc_bridge_input", label_visibility="collapsed")
         
         tc_highlighted_rows = []
+        import json as _json
         if tc_bridge_val and len(tc_bridge_val) > 2:
             try:
                 tc_highlighted_rows = _json.loads(tc_bridge_val)
             except: pass
         
         if not tc_highlighted_rows:
-            # JS fallback: read from localStorage directly
             st.components.v1.html(f"""
             <script>
             (function() {{
@@ -2090,7 +2515,42 @@ def main():
                 st.rerun()
         else:
             st.session_state['_tc_sai_lech_synced'] = False
-        
+
+        # --- SYNC USER NOTES BRIDGE ---
+        user_notes_data = st.session_state.get('_user_notes_data', '')
+        if not user_notes_data or len(user_notes_data) < 3:
+            st.components.v1.html(f"""
+            <script>
+            (function() {{
+                const key = "user_notes_{_upload_id}";
+                const saved = localStorage.getItem(key);
+                if (saved && saved !== "{{}}" && saved.length > 2) {{
+                    const parentDoc = window.parent.document;
+                    const target = Array.from(parentDoc.querySelectorAll('input')).find(i =>
+                        i.getAttribute('aria-label') === 'GhiChu_Bridge'
+                    );
+                    if (target && target.value !== saved) {{
+                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+                        setter.call(target, saved);
+                        target.focus();
+                        target.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        target.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        target.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }}));
+                        target.blur();
+                    }}
+                }}
+            }})();
+            </script>
+            """, height=0)
+            
+            if not st.session_state.get('_notes_auto_synced', False):
+                st.session_state['_notes_auto_synced'] = True
+                import time as _t_notes
+                _t_notes.sleep(0.3)
+                st.rerun()
+        else:
+            st.session_state['_notes_auto_synced'] = False
+            
         # Build tc_sai_lech_df
         if tc_highlighted_rows:
             tc_err_list = []
@@ -2106,32 +2566,27 @@ def main():
                         "Loại (TT/TK)": r.get('loai', ''),
                         "Chiều dài (TT/TK)": r.get('chieu_dai', ''),
                         "Trạng thái Lỗi": r.get('trang_thai', ''),
-                        "Chi tiết": chi_tiet
+                        "Chi tiết": chi_tiet,
+                        "Ghi chú": r.get('ghi_chu', '')
                     })
             if tc_err_list:
                 tc_sai_lech_df = pd.DataFrame(tc_err_list)
                 tc_sai_lech_df.insert(0, "Hạng mục", "TuyenCap")
                 
-                # Gộp vào TuyenCap đã có (nếu có)
                 if 'TuyenCap' in errors_dict:
                     combined = errors_dict['TuyenCap']
-                    # Cập nhật nội dung cho các dòng đã tồn tại hoặc thêm mới từ danh sách highlight
                     for _, new_row in tc_sai_lech_df.iterrows():
                         tuyen_val = str(new_row['Tuyến cáp'])
                         mask = (combined['Tuyến cáp'].astype(str) == tuyen_val)
                         if mask.any():
-                            # Nếu đã tồn tại, cập nhật Chi tiết (đảm bảo thêm "Sai điểm đầu" nếu chưa có)
                             idx = combined[mask].index[0]
                             old_ct = str(combined.at[idx, 'Chi tiết'])
                             if "Sai điểm đầu" not in old_ct:
                                 combined.at[idx, 'Chi tiết'] = (old_ct + '; Sai điểm đầu') if old_ct else 'Sai điểm đầu'
                         else:
-                            # Nếu chưa tồn tại, thêm mới
                             combined = pd.concat([combined, pd.DataFrame([new_row])], ignore_index=True)
-                    
                     combined.index = range(1, len(combined) + 1)
                     errors_dict['TuyenCap'] = combined
-                    # Cập nhật trong all_errors
                     for i, e in enumerate(all_errors):
                         if not e.empty and str(e.iloc[0].get('Hạng mục', '')) == 'TuyenCap':
                             all_errors[i] = combined
@@ -2141,14 +2596,139 @@ def main():
                     errors_dict['TuyenCap'] = tc_sai_lech_df
                     all_errors.append(tc_sai_lech_df)
         
-        if errors_dict:
-            with c_btn:
-                st.write("") # Spacer
-                st.write("")
-                p_name = st.session_state.get('project_name', 'BaoCao')
-                if not p_name: p_name = "BaoCao"
-                fn = f"{p_name}_Check_truoc_NThu.xlsx"
-                st.download_button("📥 Tải Báo cáo Tổng hợp", to_excel_multiple_sheets(errors_dict), fn, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        # --- PREPARE SUMMARIES FOR EXCEL ---
+        def format_short_node_excel(name):
+            name = str(name).strip()
+            if '.' in name: name = name.split('.')[-1]
+            parts = name.split('/')
+            if parts[0]: parts[0] = parts[0].lstrip('0')
+            return '/'.join(parts)
+
+        # 1. Summary DoiTuong
+        tong_dt_tk = 0
+        tk_valid_keys_dt = []
+        if not df_std_tk.empty and len(df_std_tk.columns) > 7:
+            col_obj_tk_dt = df_std_tk.columns[0]
+            for _, row in df_std_tk.iterrows():
+                val_h = row.iloc[7] if len(row) > 7 else pd.NA
+                if pd.notna(val_h) and str(val_h).strip() != "":
+                    tong_dt_tk += 1
+                    raw_obj = str(row[col_obj_tk_dt]).strip()
+                    if raw_obj and raw_obj.lower() != 'nan':
+                        key = raw_obj.split('-')[0].strip()
+                        key = qa._normalize_text(key)
+                        tk_valid_keys_dt.append(key)
+        tong_dt_tc = len(res_doi_tuong)
+        bbnt_keys_dt = res_doi_tuong['Đối tượng'].dropna().apply(lambda x: str(x).split('-')[0].strip()).apply(qa._normalize_text).tolist()
+        diff_text_dt = ""
+        if tong_dt_tc > tong_dt_tk:
+            tk_temp = tk_valid_keys_dt.copy()
+            thua = []
+            for k in bbnt_keys_dt:
+                if k in tk_temp: tk_temp.remove(k)
+                else: thua.append(k)
+            if thua:
+                thua_str = ', '.join(dict.fromkeys([format_short_node_excel(k) for k in thua]))
+                diff_text_dt = f", Đối tượng thừa so thiết kế: {thua_str}"
+        elif tong_dt_tc < tong_dt_tk:
+            bbnt_temp = bbnt_keys_dt.copy()
+            thieu = []
+            for k in tk_valid_keys_dt:
+                if k in bbnt_temp: bbnt_temp.remove(k)
+                else: thieu.append(k)
+            if thieu:
+                thieu_str = ', '.join(dict.fromkeys([format_short_node_excel(k) for k in thieu]))
+                diff_text_dt = f", Đối tượng thiếu so thiết kế: {thieu_str}"
+        dt_summ_str = f"Tổng đối tượng thiết kế: {tong_dt_tk}, Tổng đối tượng thi công: {tong_dt_tc}{diff_text_dt}"
+
+        # 2. Summary TuyenCap
+        total_design_len = qa.calculate_total_design_length(df_tk_cap)
+        total_construction_count = len(res_tuyen_cap)
+        col_tc = qa._find_column(df_tk_cap, ["Số lượng", "Chiều dài"])
+        if not col_tc and len(df_tk_cap.columns) > 4: col_tc = df_tk_cap.columns[4]
+        tk_valid_keys_tc = []
+        col_obj_tk_tc = qa._find_column(df_tk_cap, ["Tên đối tượng", "Đối tượng"])
+        if not col_obj_tk_tc and len(df_tk_cap.columns) > 0: col_obj_tk_tc = df_tk_cap.columns[0]
+        if col_tc and col_obj_tk_tc:
+            for _, row in df_tk_cap.iterrows():
+                val = row[col_tc]
+                if pd.isna(val): continue
+                digits = "".join(filter(str.isdigit, str(val).strip()))
+                if digits:
+                    key = str(row[col_obj_tk_tc]).split('-')[0].strip()
+                    key = qa._normalize_text(key)
+                    tk_valid_keys_tc.append(key)
+        bbnt_keys_tc = res_tuyen_cap['Điểm cuối (Key)'].dropna().apply(qa._normalize_text).tolist()
+        diff_text_tc = ""
+        if total_construction_count > total_design_len:
+            tk_temp = tk_valid_keys_tc.copy()
+            thua = []
+            for k in bbnt_keys_tc:
+                if k in tk_temp: tk_temp.remove(k)
+                else: thua.append(k)
+            if thua:
+                thua_str = ', '.join(dict.fromkeys([format_short_node_excel(k) for k in thua]))
+                diff_text_tc = f", Tuyến thừa so thiết kế: {thua_str}"
+        elif total_construction_count < total_design_len:
+            bbnt_temp = bbnt_keys_tc.copy()
+            thieu = []
+            for k in tk_valid_keys_tc:
+                if k in bbnt_temp: bbnt_temp.remove(k)
+                else: thieu.append(k)
+            if thieu:
+                thieu_str = ', '.join(dict.fromkeys([format_short_node_excel(k) for k in thieu]))
+                diff_text_tc = f", Tuyến thiếu so thiết kế: {thieu_str}"
+        tc_summ_str = f"Tổng tuyến thiết kế: {total_design_len}, Tổng tuyến thi công: {total_construction_count}{diff_text_tc}"
+
+        # --- PREPARE FULL REPORT DATA ---
+        full_report_dict = {
+            "DoiTuong": res_doi_tuong,
+            "TuyenCap": res_tuyen_cap,
+            "HanNoi": res_han_noi,
+            "VatTu": res_vat_tu
+        }
+        
+        # Summary weld for excel report
+        dn_hn = int(res_han_noi['SL đề nghị'].astype(float).fillna(0).sum()) if 'SL đề nghị' in res_han_noi.columns else 0
+        tk_hn = int(res_han_noi['SL Thiết kế'].astype(float).fillna(0).sum()) if 'SL Thiết kế' in res_han_noi.columns else 0
+        hn_summ_str = f"Tổng đề nghị: {dn_hn}, Tổng thiết kế: {tk_hn}"
+
+        pre_rows_data = {
+            "DoiTuong": [dt_summ_str],
+            "TuyenCap": [tc_summ_str],
+            "HanNoi": [hn_summ_str]
+        }
+
+        if not df_imp.empty:
+            full_report_dict["FormImport_Goc"] = df_imp
+        if not df_std_tk.empty:
+            full_report_dict["ThietKe_Goc"] = df_std_tk
+        
+        if tc_highlighted_rows:
+            tc_full = res_tuyen_cap.copy()
+            for r in tc_highlighted_rows:
+                if r.get('_type') == 'tc_highlight':
+                    t_val = str(r.get('tuyen_cap'))
+                    mask = (tc_full['Tuyến cáp'].astype(str) == t_val)
+                    if mask.any():
+                        idx = tc_full[mask].index[0]
+                        tc_full.at[idx, 'Trạng thái Lỗi'] = '❌ Lệch (Manual)'
+                        ct = str(tc_full.at[idx, 'Chi tiết'])
+                        if "Sai điểm đầu" not in ct:
+                            tc_full.at[idx, 'Chi tiết'] = (ct + "; Sai điểm đầu") if ct else "Sai điểm đầu"
+            full_report_dict["TuyenCap"] = tc_full
+
+        with c_btn:
+            st.write("") 
+            st.write("")
+            p_name = st.session_state.get('project_name', 'BaoCao') or "BaoCao"
+            fn = f"{p_name}_Check_truoc_NThu.xlsx"
+            st.download_button(
+                "📥 Tải Báo cáo Sai lệch", 
+                to_excel_multiple_sheets(full_report_dict, filter_errors_only=True, include_warnings=True, pre_rows=pre_rows_data), 
+                fn, 
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         if not all_errors:
             st.success("🎉 Tuyệt vời! Không tìm thấy sai lệch nào trong dữ liệu.")
@@ -2159,43 +2739,26 @@ def main():
                 if edf.empty: continue
                 cat = str(edf.iloc[0].get('Hạng mục', 'Unknown'))
                 
-                # Special display for manual "Han noi soat" category
-                is_manual = (cat == "Han noi soat" or ("Nhập đối tượng" in edf.columns and "Mối hàn từ hàn nối" in edf.columns))
-                
                 with st.expander(f"🔴 {cat} ({len(edf)} lỗi)", expanded=False):
-                    if is_manual:
-                        disp_df = edf.drop(columns=['Hạng mục'], errors='ignore').copy()
-                        disp_df.index.name = "#"
+                    wrap_cols = [c for c in edf.columns if c in ["Kiểm tra Vị trí", "Chi tiết", "Tên vật tư", "Ghi chú"]]
+                    nowrap_cols = [c for c in edf.columns if c not in wrap_cols]
+                    
+                    styled_edf = edf.style.apply(highlight_rows, axis=1) if 'Trạng thái Lỗi' in edf.columns else edf.style
                         
-                        def highlight_han_noi(row):
-                            return ['background-color: #ffeeb2 !important; font-weight: bold; color: #995c00 !important' if c in ["Mối hàn từ hàn nối", "Đối tượng từ hàn nối"] else '' for c in disp_df.columns]
-                        
-                        styled_edf = disp_df.style.apply(highlight_han_noi, axis=1)
-                        styled_edf = styled_edf.set_properties(**{
-                            'border': '1px solid #d0d7de', 
-                            'padding': '10px'
-                        })
-                    else:
-                        wrap_cols = [c for c in edf.columns if c in ["Kiểm tra Vị trí", "Chi tiết", "Tên vật tư"]]
-                        nowrap_cols = [c for c in edf.columns if c not in wrap_cols]
-                        
-                        if 'Trạng thái Lỗi' in edf.columns:
-                            styled_edf = edf.style.apply(highlight_rows, axis=1)
-                        else:
-                            styled_edf = edf.style
-                            
-                        styled_edf = styled_edf.set_properties(subset=nowrap_cols, **{'white-space': 'nowrap', 'overflow': 'hidden'})
-                        if wrap_cols:
-                            styled_edf = styled_edf.set_properties(subset=wrap_cols, **{'white-space': 'normal', 'word-wrap': 'break-word', 'min-width': '300px', 'max-width': '500px'})
+                    styled_edf = styled_edf.set_properties(subset=nowrap_cols, **{'white-space': 'nowrap', 'overflow': 'hidden'})
+                    if wrap_cols:
+                        styled_edf = styled_edf.set_properties(subset=wrap_cols, **{'white-space': 'normal', 'word-wrap': 'break-word', 'min-width': '300px', 'max-width': '500px'})
 
-                        # Format SL columns to 1 decimal place
-                        sl_fmt = {c: "{:.1f}" for c in edf.columns if "SL" in c and edf[c].dtype in ['float64', 'float32']}
-                        if sl_fmt:
-                            styled_edf = styled_edf.format(sl_fmt)
+                    # Format SL columns
+                    sl_fmt = {c: "{:.1f}" for c in edf.columns if "SL" in c and edf[c].dtype in ['float64', 'float32']}
+                    if sl_fmt:
+                        styled_edf = styled_edf.format(sl_fmt)
 
                     with st.container(height=450, border=True):
                         st.table(styled_edf)
 
 
+
 if __name__ == "__main__":
+    monitor_resource_usage()
     main()
