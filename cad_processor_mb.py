@@ -157,10 +157,12 @@ def extract_gpon_topology(dxf_path):
     lines_pts = []
     splices_texts = []
 
-    # Select layouts that actually contain GPON cabinet blocks (e.g. matching P\d{2,4}\.\d{4})
-    # to avoid scanning empty layouts or unrelated sheets, while ensuring ModelSpace is scanned if it has the design.
+    # Select layouts that actually contain GPON cabinet blocks (e.g. matching P\d{2,4}\.\d{4}),
+    # completely ignoring ModelSpace as per the instruction.
     gpon_layouts = []
     for l in doc.layouts:
+        if getattr(l, 'name', '').upper() == 'MODEL':
+            continue
         has_gpon = False
         try:
             for t in l.query('TEXT MTEXT'):
@@ -173,11 +175,10 @@ def extract_gpon_topology(dxf_path):
         if has_gpon:
             gpon_layouts.append(l)
             
-    layouts = gpon_layouts if gpon_layouts else [doc.modelspace()]
-    # Sort layouts so that 'MODEL' space is processed first,
-    # allowing paper space print layouts to overwrite/update with official sheet values.
+    layouts = gpon_layouts
+    # Sort layouts alphabetically to ensure deterministic processing order
     try:
-        layouts.sort(key=lambda l: 0 if getattr(l, 'name', '').upper() == 'MODEL' else 1)
+        layouts.sort(key=lambda l: getattr(l, 'name', '').upper())
     except:
         pass
 
@@ -469,11 +470,10 @@ def extract_gpon_topology(dxf_path):
                 
         for line in re.split(r'\\P|\n|\^J', clean_text):
             if '-' in line:
-                parts = line.split('-')
-                if len(parts) >= 2:
-                    left_part = parts[0]
-                    right_part = parts[1]
-                    
+                # Tìm TẤT CẢ các cặp kết nối X - Y trong dòng
+                # (trước đây chỉ lấy cặp đầu tiên khi dùng split('-'))
+                pairs = re.findall(r'([\w.]+)\s*-\s*([\w.]+)', line)
+                for left_part, right_part in pairs:
                     pid = None
                     cid = None
                     
@@ -484,7 +484,7 @@ def extract_gpon_topology(dxf_path):
                     left_match = re.search(r'\b[CHFTM]0*(\d{1,4})\b', left_part)
                     if left_match:
                         pid = str(int(left_match.group(1)))
-                    elif 'SP' in left_part and owner_id:
+                    elif 'SP' in left_part.upper() and owner_id:
                         pid = owner_id
                         
                     if pid and cid and pid != cid:

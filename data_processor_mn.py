@@ -814,18 +814,7 @@ class QALogic:
                 "Ghi chú": ""
             })
             
-        # 2. Quét các vị trí có trong Thiết kế nhưng BBNT KHÔNG có
-        for tk_key, tk_val in dict_tk.items():
-            if tk_key not in matched_tk_keys:
-                raw_name = tk_positions_raw.get(tk_key, tk_key)
-                results.append({
-                    "Vị trí": raw_name,
-                    "SL Thiết kế": f"{tk_val:g}",
-                    "SL đề nghị": "0",
-                    "Trạng thái Lỗi": "❌ Thiếu trong biên bản",
-                    "Chi tiết": f"- Vị trí có trong Thiết kế (TK={tk_val}) nhưng KHÔNG có trong BBNT Đề nghị",
-                    "Ghi chú": ""
-                })
+        # (Đã bỏ logic tự động thêm các vị trí có trong Thiết kế nhưng BBNT KHÔNG có theo yêu cầu người dùng)
                 
         return pd.DataFrame(results)
 

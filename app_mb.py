@@ -745,11 +745,19 @@ def main():
                     if pd.isna(key): return ""
                     key_str = str(key).strip().upper()
                     
+                    def resolve_parent(node_data):
+                        p = node_data.get('parent', 'Không tìm thấy')
+                        if p == 'Không tìm thấy' or not p:
+                            gp = node_data.get('geom_parent', 'Không tìm thấy')
+                            if gp and gp != 'Không tìm thấy':
+                                return gp
+                        return p
+                    
                     if key_str in cad_map:
-                        return cad_map[key_str]['parent']
+                        return resolve_parent(cad_map[key_str])
                     prefix_key = key_str.split('/')[0] if '/' in key_str else key_str
                     if prefix_key in cad_map:
-                        return cad_map[prefix_key]['parent']
+                        return resolve_parent(cad_map[prefix_key])
                         
                     # Extremely robust regex-based key lookup (works for HNI570.0379, HNIP570.0379, P570.0379, etc.)
                     match = re.search(r'P?\d{2,4}\.\d{4}', key_str)
@@ -763,10 +771,10 @@ def main():
                             suffix = '/' + key_str.split('/')[-1]
                             
                         k1 = core_key + suffix
-                        if k1 in cad_map: return cad_map[k1]['parent']
+                        if k1 in cad_map: return resolve_parent(cad_map[k1])
                         
                         k2 = core_key
-                        if k2 in cad_map: return cad_map[k2]['parent']
+                        if k2 in cad_map: return resolve_parent(cad_map[k2])
                     return ""
                 
                 if 'Điểm đầu cad' not in res_tuyen_cap.columns:

@@ -783,18 +783,7 @@ class QALogic:
                 "Ghi chú": ""
             })
             
-        # 2. Quét các vị trí có trong Thiết kế nhưng BBNT KHÔNG có
-        for tk_key, tk_val in dict_tk.items():
-            if tk_key not in matched_tk_keys:
-                raw_name = tk_positions_raw.get(tk_key, tk_key)
-                results.append({
-                    "Vị trí": raw_name,
-                    "SL Thiết kế": f"{tk_val:g}",
-                    "SL đề nghị": "0",
-                    "Trạng thái Lỗi": "❌ Thiếu trong biên bản",
-                    "Chi tiết": f"- Vị trí có trong Thiết kế (TK={tk_val}) nhưng KHÔNG có trong BBNT Đề nghị",
-                    "Ghi chú": ""
-                })
+        # (Đã bỏ logic tự động thêm các vị trí có trong Thiết kế nhưng BBNT KHÔNG có theo yêu cầu người dùng)
                 
         return pd.DataFrame(results)
 
@@ -956,9 +945,12 @@ class QALogic:
             
             # --- So sánh nội bộ BBNT (H vs I) ---
             is_len_tc_err = False
-            if len_h_bbnt > len_i_bbnt:
+            if len_i_bbnt < 50 and len_h_bbnt > len_i_bbnt * 1.5:
                 is_len_tc_err = True
-                errors.append(f"C.dài thi công ({len_h_bbnt}) > Dự toán tool ({len_i_bbnt})")
+                errors.append(f"C.dài thi công ({len_h_bbnt}) vượt quá 50% Dự toán tool ({len_i_bbnt})")
+            elif len_i_bbnt >= 50 and len_h_bbnt > len_i_bbnt * 1.3:
+                is_len_tc_err = True
+                errors.append(f"C.dài thi công ({len_h_bbnt}) vượt quá 30% Dự toán tool ({len_i_bbnt})")
             elif len_i_bbnt > 0 and len_h_bbnt < len_i_bbnt * 0.5:
                 is_len_tc_err = True
                 errors.append(f"C.dài thi công ({len_h_bbnt}) < 50% Dự toán tool ({len_i_bbnt})")
